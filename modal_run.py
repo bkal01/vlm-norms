@@ -29,26 +29,36 @@ def run(run_id: str):
     import torch
     from PIL import Image
 
-    from models.smolvlm import load_model, generate
+    from models.smolvlm import load_model, generate, generate_text_only
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prompt = "Can you describe this image?"
+    out = Path("/runs") / run_id
+    out.mkdir(parents=True, exist_ok=True)
+
     processor, model = load_model(device)
 
-    generated_text, vision_h, text_h = generate(
+    vlm_text, vision_h, vlm_text_h = generate(
         image=Image.open("assets/bee.jpg"),
-        prompt="Can you describe this image?",
+        prompt=prompt,
         processor=processor,
         model=model,
     )
+    (out / "vlm_generated.txt").write_text(vlm_text)
+    torch.save(vision_h.float().detach().cpu(), out / "vlm_vision_h.pt")
+    torch.save(vlm_text_h.float().detach().cpu(), out / "vlm_text_h.pt")
+    print(f"VLM: {vlm_text}")
 
-    out = Path("/runs") / run_id
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "generated.txt").write_text(generated_text)
-    torch.save(vision_h.float().detach().cpu(), out / "vision_h.pt")
-    torch.save(text_h.float().detach().cpu(), out / "text_h.pt")
+    textonly_text, textonly_h = generate_text_only(
+        prompt=prompt,
+        processor=processor,
+        model=model,
+    )
+    (out / "textonly_generated.txt").write_text(textonly_text)
+    torch.save(textonly_h.float().detach().cpu(), out / "textonly_h.pt")
+    print(f"Text-only: {textonly_text}")
+
     runs_vol.commit()
-
-    print(generated_text)
     return run_id
 
 

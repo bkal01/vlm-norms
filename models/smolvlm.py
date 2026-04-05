@@ -1,11 +1,14 @@
 import torch
 
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import (
+    AutoProcessor,
+    AutoModelForImageTextToText,
+)
 
 
 def load_model(
-    device: torch.device
+    device: torch.device,
 ):
     processor = AutoProcessor.from_pretrained(
         "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
@@ -60,3 +63,36 @@ def generate(
         skip_special_tokens=True,
     )
     return generated_texts[0], vision_hidden_states, text_hidden_states
+
+def generate_text_only(
+    prompt: str,
+    processor,
+    model,
+):
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}],
+        }
+    ]
+    inputs = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+    outputs = model.generate(
+        **inputs,
+        do_sample=False,
+        max_new_tokens=512,
+        output_hidden_states=True,
+        return_dict_in_generate=True,
+    )
+    generated_ids = outputs.sequences
+    hidden_states = torch.stack(outputs.hidden_states[0], dim=0).squeeze(1)
+    generated_text = processor.batch_decode(
+        generated_ids[:, inputs.input_ids.shape[1]:],
+        skip_special_tokens=True,
+    )[0]
+    return generated_text, hidden_states
