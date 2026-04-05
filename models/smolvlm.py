@@ -72,7 +72,9 @@ def generate_text_only(
     messages = [
         {
             "role": "user",
-            "content": [{"type": "text", "text": prompt}],
+            "content": [
+                {"type": "text", "text": prompt},
+            ],
         }
     ]
     inputs = processor.apply_chat_template(
@@ -82,17 +84,17 @@ def generate_text_only(
         return_dict=True,
         return_tensors="pt",
     ).to(model.device)
-    outputs = model.generate(
+
+    gen_outputs = model.generate(
         **inputs,
         do_sample=False,
         max_new_tokens=512,
         output_hidden_states=True,
         return_dict_in_generate=True,
     )
-    generated_ids = outputs.sequences
-    hidden_states = torch.stack(outputs.hidden_states[0], dim=0).squeeze(1)
+    hidden_states = torch.stack(gen_outputs.hidden_states[0], dim=0).squeeze(1)
     generated_text = processor.batch_decode(
-        generated_ids[:, inputs.input_ids.shape[1]:],
+        gen_outputs.sequences[:, inputs["input_ids"].shape[1]:],
         skip_special_tokens=True,
     )[0]
     return generated_text, hidden_states
