@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from PIL import Image
 from transformers import (
@@ -20,6 +21,65 @@ def load_model(
     ).to(device)
 
     return processor, model
+
+
+def prefill(image: Image.Image, prompt: str, processor, model):
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text", "text": prompt},
+    ]}]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True,
+        tokenize=True, return_dict=True, return_tensors="pt",
+    ).to(model.device)
+    inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
+    with torch.inference_mode():
+        outputs = model(**inputs, output_hidden_states=True)
+
+    h = torch.stack(outputs.hidden_states, dim=0).squeeze(1)
+    ids = inputs["input_ids"][0]
+    fake_id = processor.tokenizer.convert_tokens_to_ids("<fake_token_around_image>")
+    fake_pos = (ids == fake_id).nonzero(as_tuple=True)[0]
+    vision_mask = torch.zeros(len(ids), dtype=torch.bool, device=ids.device)
+    vision_mask[fake_pos[0]:fake_pos[-1] + 1] = True
+    return h[:, vision_mask, :], h[:, ~vision_mask, :]
+
+
+def prefill_text_only(prompt: str, processor, model):
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+    ]}]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True,
+        tokenize=True, return_dict=True, return_tensors="pt",
+    ).to(model.device)
+
+    with torch.inference_mode():
+        outputs = model(**inputs, output_hidden_states=True)
+
+    return torch.stack(outputs.hidden_states, dim=0).squeeze(1)
+
+
+def compute_metrics(h: torch.Tensor) -> dict[str, torch.Tensor]:
+    """
+    h is of shape (L, N, D)
+    we want:
+    - norm for each layer averaged over N tokens
+    - absolute update magnitude for each layer averaged over tokens
+    - relative update magnitude for each layer averaged over tokens
+    - cosine similarity to layer-0 embedding for each layer averaged over tokens
+    """
+    norms = h.norm(dim=-1).mean(dim=-1)
+
+    diffs = (h[1:] - h[:-1]).norm(dim=-1)
+    base = h[:-1].norm(dim=-1).clamp(min=1e-8)
+    rel = (diffs / base).mean(dim=-1)
+
+    cos = F.cosine_similarity(h, h[0].unsqueeze(0), dim=-1).mean(dim=-1)
+    
+    return {"norms": norms, "abs": diffs.mean(dim=-1), "rel": rel, "cos": cos}
+
 
 def generate(
     image: Image.Image,

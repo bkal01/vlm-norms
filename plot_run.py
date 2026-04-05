@@ -2,64 +2,37 @@ import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
-import torch.nn.functional as F
 
 
-def plot_hidden_states(hidden_dict: dict[str, torch.Tensor], title: str):
-    first = next(iter(hidden_dict.values()))
-    L = first.shape[0]
-    layers = list(range(L))
-    layers_update = list(range(1, L))
+METRIC_KEYS = {
+    "norms": {"ylabel": r"mean $\|h_\ell\|$", "title": "Mean token norm"},
+    "abs": {"ylabel": r"mean $\|h_\ell - h_{\ell-1}\|$", "title": "Absolute update magnitude"},
+    "rel": {"ylabel": r"$\|h_\ell - h_{\ell-1}\| \;/\; \|h_{\ell-1}\|$", "title": "Relative update magnitude"},
+    "cos": {"ylabel": r"mean $\cos(h_\ell,\, h_0)$", "title": "Cosine similarity to layer-0 embedding"},
+}
+SERIES = [
+    ("vision", "Vision tokens (VLM)"),
+    ("text", "Text tokens (VLM)"),
+    ("textonly", "Text-only model"),
+]
 
-    norms, abs_updates, rel_updates, cosines = {}, {}, {}, {}
-    for name, h in hidden_dict.items():
-        norms[name] = h.norm(dim=-1).mean(dim=-1).numpy()
-        abs_updates[name] = (h[1:] - h[:-1]).norm(dim=-1).mean(dim=-1).numpy()
-        rel_updates[name] = (
-            (h[1:] - h[:-1]).norm(dim=-1).mean(dim=-1) / h[:-1].norm(dim=-1).mean(dim=-1)
-        ).numpy()
-        cosines[name] = F.cosine_similarity(h, h[0:1].expand_as(h), dim=-1).mean(dim=-1).numpy()
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle(title, fontsize=11)
-    kw = dict(marker="o", markersize=3)
-
-    ax = axes[0, 0]
-    for name, vals in norms.items():
-        ax.plot(layers, vals, label=name, **kw)
-    ax.set_title("Mean token norm")
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(r"mean $\|h_\ell\|$")
-    ax.legend()
-
-    ax = axes[0, 1]
-    for name, vals in abs_updates.items():
-        ax.plot(layers_update, vals, label=name, **kw)
-    ax.set_title("Absolute update magnitude")
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(r"mean $\|h_\ell - h_{\ell-1}\|$")
-    ax.legend()
-
-    ax = axes[1, 0]
-    for name, vals in rel_updates.items():
-        ax.plot(layers_update, vals, label=name, **kw)
-    ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
-    ax.set_title("Relative update magnitude")
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(r"$\|h_\ell - h_{\ell-1}\| \;/\; \|h_{\ell-1}\|$")
-    ax.legend()
-
-    ax = axes[1, 1]
-    for name, vals in cosines.items():
-        ax.plot(layers, vals, label=name, **kw)
-    ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
-    ax.set_title("Cosine similarity to layer-0 embedding")
-    ax.set_xlabel("Layer")
-    ax.set_ylabel(r"mean $\cos(h_\ell,\, h_0)$")
-    ax.legend()
-
-    plt.tight_layout()
+def load_run(run_dir: Path) -> dict[str, list[torch.Tensor]]:
+    """Load all sample metrics.pt files and group by metric key."""
+    stacks: dict[str, list[torch.Tensor]] = {
+        f"{s}_{m}": [] for s, _ in SERIES for m in METRIC_KEYS
+    }
+    sample_dirs = sorted(
+        p for p in run_dir.iterdir()
+        if p.is_dir() and (p / "metrics.pt").exists()
+    )
+    for sd in sample_dirs:
+        d = torch.load(sd / "metrics.pt", map_location="cpu", weights_only=False)
+        for key in stacks:
+            stacks[key].append(d[key])
+    return {k: torch.stack(v) for k, v in stacks.items() if v}
 
 
 def main():
@@ -68,26 +41,33 @@ def main():
     p.add_argument("--runs-dir", default="runs", type=Path)
     args = p.parse_args()
 
-    base = args.runs_dir / args.run_id
-    _load = lambda f: torch.load(base / f, map_location="cpu", weights_only=False).float()
+    run_dir = args.runs_dir / args.run_id
+    data = load_run(run_dir)
 
-    vlm_vision_h = _load("vlm_vision_h.pt")
-    vlm_text_h = _load("vlm_text_h.pt")
-    textonly_h = _load("textonly_h.pt")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle(args.run_id, fontsize=11)
 
-    vlm_txt = (base / "vlm_generated.txt").read_text()
-    textonly_txt = (base / "textonly_generated.txt").read_text()
-    print(f"VLM: {vlm_txt}")
-    print(f"Text-only: {textonly_txt}")
+    for ax, (metric, info) in zip(axes.flat, METRIC_KEYS.items()):
+        is_update = metric in ("abs", "rel")
+        for series_key, label in SERIES:
+            vals = data[f"{series_key}_{metric}"].numpy()
+            mean = vals.mean(axis=0)
+            std = vals.std(axis=0)
+            x = np.arange(1, len(mean) + 1) if is_update else np.arange(len(mean))
+            line, = ax.plot(x, mean, label=label, marker="o", markersize=3)
+            ax.fill_between(x, mean - std, mean + std, alpha=0.2, color=line.get_color())
 
-    plot_hidden_states(
-        {"vision": vlm_vision_h, "text": vlm_text_h},
-        title=f"VLM — {args.run_id}",
-    )
-    plot_hidden_states(
-        {"text": textonly_h},
-        title=f"Text-only — {args.run_id}",
-    )
+        if metric == "rel":
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
+        elif metric == "cos":
+            ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+
+        ax.set_title(info["title"])
+        ax.set_xlabel("Layer")
+        ax.set_ylabel(info["ylabel"])
+        ax.legend()
+
+    plt.tight_layout()
     plt.show()
 
 
