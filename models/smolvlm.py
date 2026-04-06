@@ -69,16 +69,28 @@ def compute_metrics(h: torch.Tensor) -> dict[str, torch.Tensor]:
     - absolute update magnitude for each layer averaged over tokens
     - relative update magnitude for each layer averaged over tokens
     - cosine similarity to layer-0 embedding for each layer averaged over tokens
+    - cosine similarity between update and previous layer, averaged over tokens
+    - cosine similarity cos(h_l, h_{l-1}), averaged over tokens
     """
     norms = h.norm(dim=-1).mean(dim=-1)
 
-    diffs = (h[1:] - h[:-1]).norm(dim=-1)
+    updates = h[1:] - h[:-1]
+    diffs = updates.norm(dim=-1)
     base = h[:-1].norm(dim=-1).clamp(min=1e-8)
     rel = (diffs / base).mean(dim=-1)
 
     cos = F.cosine_similarity(h, h[0].unsqueeze(0), dim=-1).mean(dim=-1)
-    
-    return {"norms": norms, "abs": diffs.mean(dim=-1), "rel": rel, "cos": cos}
+    update_align = F.cosine_similarity(updates, h[:-1], dim=-1).mean(dim=-1)
+    adjacent_cos = F.cosine_similarity(h[1:], h[:-1], dim=-1).mean(dim=-1)
+
+    return {
+        "norms": norms,
+        "abs": diffs.mean(dim=-1),
+        "rel": rel,
+        "cos": cos,
+        "update_align": update_align,
+        "adjacent_cos": adjacent_cos,
+    }
 
 
 def generate(

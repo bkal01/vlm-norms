@@ -11,6 +11,14 @@ METRIC_KEYS = {
     "abs": {"ylabel": r"mean $\|h_\ell - h_{\ell-1}\|$", "title": "Absolute update magnitude"},
     "rel": {"ylabel": r"$\|h_\ell - h_{\ell-1}\| \;/\; \|h_{\ell-1}\|$", "title": "Relative update magnitude"},
     "cos": {"ylabel": r"mean $\cos(h_\ell,\, h_0)$", "title": "Cosine similarity to layer-0 embedding"},
+    "adjacent_cos": {
+        "ylabel": r"mean $\cos(h_\ell,\, h_{\ell-1})$",
+        "title": "Cosine similarity to previous layer",
+    },
+    "update_align": {
+        "ylabel": r"mean $\cos(h_\ell - h_{\ell-1},\, h_{\ell-1})$",
+        "title": "Update vs previous residual",
+    },
 }
 SERIES = [
     ("vision", "Vision tokens (VLM)"),
@@ -44,11 +52,13 @@ def main():
     run_dir = args.runs_dir / args.run_id
     data = load_run(run_dir)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    axes_flat = axes.flatten()
     fig.suptitle(args.run_id, fontsize=11)
 
-    for ax, (metric, info) in zip(axes.flat, METRIC_KEYS.items()):
-        is_update = metric in ("abs", "rel")
+    for idx, (metric, info) in enumerate(METRIC_KEYS.items()):
+        ax = axes_flat[idx]
+        is_update = metric in ("abs", "rel", "update_align", "adjacent_cos")
         for series_key, label in SERIES:
             vals = data[f"{series_key}_{metric}"].numpy()
             mean = vals.mean(axis=0)
@@ -61,6 +71,10 @@ def main():
             ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
         elif metric == "cos":
             ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+        elif metric == "update_align":
+            ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+        elif metric == "adjacent_cos":
+            ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8)
 
         ax.set_title(info["title"])
         ax.set_xlabel("Layer")
