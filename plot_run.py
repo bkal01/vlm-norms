@@ -60,7 +60,7 @@ def main():
         ax = axes_flat[idx]
         is_update = metric in ("abs", "rel", "update_align", "adjacent_cos")
         for series_key, label in SERIES:
-            vals = data[f"{series_key}_{metric}"].numpy()
+            vals = data[f"{series_key}_{metric}"].numpy()[..., :-1]
             mean = vals.mean(axis=0)
             std = vals.std(axis=0)
             x = np.arange(1, len(mean) + 1) if is_update else np.arange(len(mean))
