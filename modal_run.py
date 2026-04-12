@@ -40,17 +40,20 @@ image = (
 
 
 @app.function(image=image, gpu="A10G", timeout=3600, volumes={"/runs": runs_vol})
-def run(run_id: str, subsets: list[str], num_samples: int):
+def run(run_id: str, subsets: list[str], num_samples: int, model_name: str):
     import torch
     from datasets import load_dataset
     from tqdm import tqdm
 
-    from models.smolvlm import (
-        load_model,
-        prefill,
-        prefill_text_only,
-        compute_metrics,
-    )
+    from models.utils import compute_metrics
+
+    if model_name == "Qwen/Qwen3-VL-2B-Instruct":
+        from models.qwen3vl import load_model, prefill, prefill_text_only
+    elif model_name == "HuggingFaceTB/SmolVLM2-2.2B-Instruct":
+        from models.smolvlm import load_model, prefill, prefill_text_only
+    else:
+        raise ValueError(f"unknown model_name={model_name!r}")
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_dir = Path("/runs") / run_id
@@ -60,7 +63,7 @@ def run(run_id: str, subsets: list[str], num_samples: int):
         "run_id": run_id,
         "subsets": subsets,
         "num_samples_per_subset": num_samples,
-        "model": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+        "model": model_name,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
     }
     (run_dir / "config.json").write_text(json.dumps(config, indent=2))
@@ -120,10 +123,11 @@ def run(run_id: str, subsets: list[str], num_samples: int):
 def main(
     subsets: str = ",".join(DEFAULT_SUBSETS),
     num_samples: int = 10,
+    model: str = "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
 ):
     run_id = str(uuid.uuid4())
     subset_list = [s.strip() for s in subsets.split(",")]
-    run.remote(run_id, subset_list, num_samples)
+    run.remote(run_id, subset_list, num_samples, model)
     print(f"run_id={run_id}")
     print(
         f"Pull artifacts: modal volume get {VOLUME_NAME} {run_id} runs"
