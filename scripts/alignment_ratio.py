@@ -1,15 +1,10 @@
 """
 Figure: obs vs predicted cosine trajectory for vision and text tokens.
-Table: mean alignment ratio (obs / pred) across all layers.
+Table: layer-1 rel, cos(h_1, h_0), and cos(u_1, h_0) (update alignment).
 
-Predicted cosine assumes updates are random in direction:
+Predicted cosine (dashed line in figure) assumes updates are random in direction:
   pred_cos[l] = prod_{k=1}^{l} 1 / sqrt(1 + r_k^2)
 where r_k = ||u_k|| / ||h_{k-1}|| is the relative update magnitude.
-
-ratio = obs_cos / pred_cos
-  ~1   → norm dilution explains the directional stability
-  >1   → updates are partially aligned with the residual
-  <1   → updates are anti-aligned (obs decays faster than random predicts)
 
 The final layer is excluded throughout (normalization artifact).
 """
@@ -46,7 +41,7 @@ def load_metrics(run_root):
     run_id = os.listdir(run_root)[0]
     run_dir = os.path.join(run_root, run_id)
 
-    buckets = {tt: {"obs": [], "pred": [], "ratio": []}
+    buckets = {tt: {"obs": [], "pred": [], "ratio": [], "rel": [], "update_align": []}
                for tt in ("vision", "text")}
 
     for sample in os.listdir(run_dir):
@@ -56,29 +51,34 @@ def load_metrics(run_root):
         m = torch.load(path, weights_only=True)
 
         for tt in ("vision", "text"):
-            rel = m[f"{tt}_rel"][:-1].float().numpy()   # drop final layer
-            obs = m[f"{tt}_cos"][:-1].float().numpy()   # drop final layer
-            pred = predicted_cos_trajectory(rel)         # [L-1]
+            rel          = m[f"{tt}_rel"][:-1].float().numpy()
+            obs          = m[f"{tt}_cos"][:-1].float().numpy()
+            update_align = m[f"{tt}_update_align"][:-1].float().numpy()
+            pred         = predicted_cos_trajectory(rel)
 
             buckets[tt]["obs"].append(obs)
             buckets[tt]["pred"].append(pred)
             buckets[tt]["ratio"].append(obs[1:] / pred[1:])
+            buckets[tt]["rel"].append(rel)
+            buckets[tt]["update_align"].append(update_align)
 
     result = {}
     for tt in ("vision", "text"):
-        obs_arr   = np.stack(buckets[tt]["obs"])    # [N, L-1]
-        pred_arr  = np.stack(buckets[tt]["pred"])   # [N, L-1]
-        ratio_arr = np.stack(buckets[tt]["ratio"])  # [N, L-2]
-
-        ratio_mean = ratio_arr.mean(0)
+        obs_arr          = np.stack(buckets[tt]["obs"])
+        pred_arr         = np.stack(buckets[tt]["pred"])
+        ratio_arr        = np.stack(buckets[tt]["ratio"])
+        rel_arr          = np.stack(buckets[tt]["rel"])
+        update_align_arr = np.stack(buckets[tt]["update_align"])
 
         result[tt] = {
-            "obs_mean":  obs_arr.mean(0),
-            "obs_std":   obs_arr.std(0),
-            "pred_mean": pred_arr.mean(0),
-            "ratio_mean": ratio_mean,
-            "n_layers":  ratio_arr.shape[1],
-            "n_samples": len(obs_arr),
+            "obs_mean":          obs_arr.mean(0),
+            "obs_std":           obs_arr.std(0),
+            "pred_mean":         pred_arr.mean(0),
+            "ratio_mean":        ratio_arr.mean(0),
+            "rel_mean":          rel_arr.mean(0),
+            "update_align_mean": update_align_arr.mean(0),
+            "n_layers":          ratio_arr.shape[1],
+            "n_samples":         len(obs_arr),
         }
     return result
 
@@ -137,15 +137,29 @@ print("saved assets/alignment_ratio.png")
 
 
 # ── table ─────────────────────────────────────────────────────────────────────
+# u_1 = h_1 - h_0 (layer-1 update); h_0 is post-embed pre-block residual.
 
 print()
-col_w = 14
-header = (f"{'Model':<20}  {'n samples':>{col_w}}  {'mean ratio':>{col_w}}")
+col_rel = "||u_1||/||h_0||"
+col_obs = "cos(h_1, h_0)"
+col_aln = "cos(u_1, h_0)"
+w = max(len(col_rel), len(col_obs), len(col_aln), 10)
+header = (
+    f"{'Model':<20}  {'token':>6}  {col_rel:>{w}}  "
+    f"{col_obs:>{w}}  {col_aln:>{w}}  {'n':>5}"
+)
 sep = "-" * len(header)
 print(header)
 print(sep)
 for model_label, d in stats.items():
-    r = d["vision"]
-    ratio = float(r["ratio_mean"].mean())
-    print(f"{model_label:<20}  {r['n_samples']:>{col_w}}  {ratio:>{col_w}.3f}")
+    for tt in ("vision", "text"):
+        r      = d[tt]
+        rel1   = float(r["rel_mean"][0])
+        obs1   = float(r["obs_mean"][1])
+        align1 = float(r["update_align_mean"][0])
+        n      = r["n_samples"]
+        print(
+            f"{model_label:<20}  {tt:>6}  {rel1:>{w}.4f}  "
+            f"{obs1:>{w}.4f}  {align1:>{w}.4f}  {n:>5}"
+        )
 print(sep)
