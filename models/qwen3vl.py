@@ -8,7 +8,7 @@ def load_model(device: torch.device):
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         "Qwen/Qwen3-VL-2B-Instruct",
         dtype=torch.bfloat16,
-        _attn_implementation="sdpa",
+        _attn_implementation="eager",
     ).to(device)
     return processor, model
 
@@ -87,6 +87,146 @@ def prefill_text_only(prompt: str, processor, model):
     text_mask = text_only_mask(processor, inputs["input_ids"][0])
     return hidden_states[:, text_mask, :]
 
+
+def generate(
+    image: Image.Image,
+    prompt: str,
+    processor,
+    model,
+    max_new_tokens: int = 512,
+    **generate_kwargs,
+):
+    """
+    Generate from multimodal input and return generation-time artifacts.
+    """
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": image},
+        {"type": "text", "text": prompt},
+    ]}]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True,
+        tokenize=True, return_dict=True, return_tensors="pt",
+    ).to(model.device)
+    if "pixel_values" in inputs:
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
+    generation_args = {
+        "do_sample": False,
+        "max_new_tokens": max_new_tokens,
+        "output_attentions": True,
+        "output_hidden_states": True,
+        "output_scores": True,
+        "return_dict_in_generate": True,
+    }
+    if hasattr(getattr(model, "generation_config", None), "output_logits"):
+        generation_args["output_logits"] = True
+    generation_args.update(generate_kwargs)
+
+    with torch.inference_mode():
+        outputs = model.generate(**inputs, **generation_args)
+
+    prompt_length = inputs["input_ids"].shape[1]
+    generated_token_ids = outputs.sequences[:, prompt_length:]
+    generated_text = processor.batch_decode(
+        generated_token_ids,
+        skip_special_tokens=True,
+    )[0]
+
+    image_mask, text_mask = multimodal_masks(processor, inputs["input_ids"][0])
+    sequence_image_mask = torch.zeros_like(outputs.sequences[0], dtype=torch.bool)
+    sequence_text_mask = torch.zeros_like(outputs.sequences[0], dtype=torch.bool)
+    sequence_generated_mask = torch.zeros_like(outputs.sequences[0], dtype=torch.bool)
+    sequence_image_mask[:prompt_length] = image_mask
+    sequence_text_mask[:prompt_length] = text_mask
+    sequence_generated_mask[prompt_length:] = True
+    prompt_attention_mask = inputs.get("attention_mask", None)
+
+    return {
+        "generated_text": generated_text,
+        "generated_token_ids": generated_token_ids[0],
+        "sequences": outputs.sequences[0],
+        "scores": getattr(outputs, "scores", None),
+        "logits": getattr(outputs, "logits", None),
+        "attentions": getattr(outputs, "attentions", None),
+        "hidden_states": getattr(outputs, "hidden_states", None),
+        "prompt_input_ids": inputs["input_ids"][0],
+        "prompt_attention_mask": prompt_attention_mask[0]
+        if prompt_attention_mask is not None else None,
+        "prompt_image_mask": image_mask,
+        "prompt_text_mask": text_mask,
+        "sequence_image_mask": sequence_image_mask,
+        "sequence_text_mask": sequence_text_mask,
+        "sequence_generated_mask": sequence_generated_mask,
+        "prompt_length": prompt_length,
+    }
+
+
+def generate_text_only(
+    prompt: str,
+    processor,
+    model,
+    max_new_tokens: int = 512,
+    **generate_kwargs,
+):
+    """
+    Generate from text-only input and return generation-time artifacts.
+    """
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    inputs = processor.apply_chat_template(
+        messages, add_generation_prompt=True,
+        tokenize=True, return_dict=True, return_tensors="pt",
+    ).to(model.device)
+
+    generation_args = {
+        "do_sample": False,
+        "max_new_tokens": max_new_tokens,
+        "output_attentions": True,
+        "output_hidden_states": True,
+        "output_scores": True,
+        "return_dict_in_generate": True,
+    }
+    if hasattr(getattr(model, "generation_config", None), "output_logits"):
+        generation_args["output_logits"] = True
+    generation_args.update(generate_kwargs)
+
+    with torch.inference_mode():
+        outputs = model.generate(**inputs, **generation_args)
+
+    prompt_length = inputs["input_ids"].shape[1]
+    generated_token_ids = outputs.sequences[:, prompt_length:]
+    generated_text = processor.batch_decode(
+        generated_token_ids,
+        skip_special_tokens=True,
+    )[0]
+
+    text_mask = text_only_mask(processor, inputs["input_ids"][0])
+    image_mask = torch.zeros_like(inputs["input_ids"][0], dtype=torch.bool)
+    sequence_image_mask = torch.zeros_like(outputs.sequences[0], dtype=torch.bool)
+    sequence_text_mask = torch.zeros_like(outputs.sequences[0], dtype=torch.bool)
+    sequence_generated_mask = torch.zeros_like(outputs.sequences[0], dtype=torch.bool)
+    sequence_text_mask[:prompt_length] = text_mask
+    sequence_generated_mask[prompt_length:] = True
+    prompt_attention_mask = inputs.get("attention_mask", None)
+
+    return {
+        "generated_text": generated_text,
+        "generated_token_ids": generated_token_ids[0],
+        "sequences": outputs.sequences[0],
+        "scores": getattr(outputs, "scores", None),
+        "logits": getattr(outputs, "logits", None),
+        "attentions": getattr(outputs, "attentions", None),
+        "hidden_states": getattr(outputs, "hidden_states", None),
+        "prompt_input_ids": inputs["input_ids"][0],
+        "prompt_attention_mask": prompt_attention_mask[0]
+        if prompt_attention_mask is not None else None,
+        "prompt_image_mask": image_mask,
+        "prompt_text_mask": text_mask,
+        "sequence_image_mask": sequence_image_mask,
+        "sequence_text_mask": sequence_text_mask,
+        "sequence_generated_mask": sequence_generated_mask,
+        "prompt_length": prompt_length,
+    }
+
 def register_intervention(model, intervention):
     orig_get_image_features = model.model.get_image_features
     def patch(*args, **kwargs):
@@ -94,4 +234,3 @@ def register_intervention(model, intervention):
         out.last_hidden_state = intervention.reduce_norm(out.last_hidden_state)
         return out
     model.model.get_image_features = patch
-

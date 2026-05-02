@@ -43,15 +43,37 @@ def parse_subsets(value: str) -> list[str]:
 
 def load_model_fns(model_name: str):
     if model_name == "Qwen/Qwen3-VL-2B-Instruct":
-        from models.qwen3vl import load_model, prefill, prefill_text_only
+        from models.qwen3vl import generate, generate_text_only, load_model
         from models.qwen3vl import register_intervention
     elif model_name == "HuggingFaceTB/SmolVLM2-2.2B-Instruct":
-        from models.smolvlm import load_model, prefill, prefill_text_only
+        from models.smolvlm import generate, generate_text_only, load_model
         from models.smolvlm import register_intervention
     else:
         raise ValueError(f"unknown model_name={model_name!r}")
 
-    return load_model, prefill, prefill_text_only, register_intervention
+    return load_model, generate, generate_text_only, register_intervention
+
+
+def to_saveable(value):
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        return value.float() if value.is_floating_point() else value
+    if isinstance(value, dict):
+        return {key: to_saveable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(to_saveable(item) for item in value)
+    if isinstance(value, list):
+        return [to_saveable(item) for item in value]
+    return value
+
+
+def generation_to_saveable(generation: dict):
+    generation = dict(generation)
+    if generation.get("scores", None) is not None:
+        generation["logits"] = None
+    return to_saveable(generation)
 
 
 def run(
@@ -71,7 +93,9 @@ def run(
     if num_samples < 0:
         raise ValueError("num_samples must be non-negative")
 
-    load_model, prefill, prefill_text_only, register_intervention = load_model_fns(model_name)
+    load_model, generate, generate_text_only, register_intervention = load_model_fns(
+        model_name
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     run_dir = runs_dir / run_id
@@ -106,15 +130,22 @@ def run(
             fmt = sample["prompt_format"]
             prompt = fmt["prefix"] + sample["question"] + fmt["suffix"]
 
-            vision_h, text_h = prefill(sample["image"], prompt, processor, model)
+            generation = generate(sample["image"], prompt, processor, model)
+            prefill_h = torch.stack(generation["hidden_states"][0], dim=0).squeeze(1)
+            vision_h = prefill_h[:, generation["prompt_image_mask"], :]
+            text_h = prefill_h[:, generation["prompt_text_mask"], :]
             vm = compute_metrics(vision_h)
             tm = compute_metrics(text_h)
 
-            textonly_h = prefill_text_only(prompt, processor, model)
+            textonly_generation = generate_text_only(prompt, processor, model)
+            textonly_h = torch.stack(
+                textonly_generation["hidden_states"][0], dim=0
+            ).squeeze(1)
+            textonly_h = textonly_h[:, textonly_generation["prompt_text_mask"], :]
             tom = compute_metrics(textonly_h)
 
             torch.save(
-                {
+                to_saveable({
                     "vision_norms": vm["norms"].cpu().float(),
                     "vision_abs": vm["abs"].cpu().float(),
                     "vision_rel": vm["rel"].cpu().float(),
@@ -133,7 +164,11 @@ def run(
                     "textonly_cos": tom["cos"].cpu().float(),
                     "textonly_update_align": tom["update_align"].cpu().float(),
                     "textonly_adjacent_cos": tom["adjacent_cos"].cpu().float(),
-                },
+                    "generation": generation_to_saveable(generation),
+                    "textonly_generation": generation_to_saveable(
+                        textonly_generation
+                    ),
+                }),
                 sample_dir / "metrics.pt",
             )
 
