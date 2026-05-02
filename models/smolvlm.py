@@ -171,3 +171,11 @@ def generate_text_only(
         skip_special_tokens=True,
     )[0]
     return generated_text, hidden_states
+
+def register_intervention(model, intervention):
+    def hook_fn(module, input, output):
+        print(f"Output shape: {output.size()}")
+        modified_output = intervention.reduce_norm(output)
+        return modified_output
+
+    model.model.connector.register_forward_hook(hook_fn)

@@ -86,3 +86,12 @@ def prefill_text_only(prompt: str, processor, model):
     hidden_states = torch.stack(outputs.hidden_states, dim=0).squeeze(1)
     text_mask = text_only_mask(processor, inputs["input_ids"][0])
     return hidden_states[:, text_mask, :]
+
+def register_intervention(model, intervention):
+    orig_get_image_features = model.model.get_image_features
+    def patch(*args, **kwargs):
+        out = orig_get_image_features(*args, **kwargs)
+        out.last_hidden_state = intervention.reduce_norm(out.last_hidden_state)
+        return out
+    model.model.get_image_features = patch
+

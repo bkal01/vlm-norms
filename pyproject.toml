@@ -8,8 +8,10 @@ dependencies = [
     "datasets>=4.8.4",
     "matplotlib>=3.10.8",
     "modal>=1.4.1",
+    "num2words>=0.5.14",
     "torch>=2.11.0",
     "torchvision>=0.26.0",
+    "tqdm>=4.67.3",
     "transformers>=5.5.0",
 ]
 
