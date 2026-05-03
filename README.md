@@ -25,6 +25,10 @@ uv run python run.py configs/smolvlm.yaml
 uv run python run.py configs/qwen3vl.yaml
 ```
 
+Each local run now writes raw generated answers to `runs/<run_id>/answers.jsonl`,
+DatBench per-sample scores to `runs/<run_id>/scores.jsonl`, and DatBench native
+reports to `runs/<run_id>/scores/<subset>_{real,textonly}.json`.
+
 **Run on Modal** (saves results to the `vlm-norms-runs` volume):
 
 ```bash

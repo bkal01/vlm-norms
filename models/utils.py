@@ -35,10 +35,51 @@ def compute_metrics(h: torch.Tensor) -> dict[str, torch.Tensor]:
 
 def compute_attention_metrics(
         attentions,
-        V,
+        prompt_image_mask,
+        prompt_text_mask,
 ):
-    # vision attention mass
-    vision_attention_mass = torch.zeros((T, L, ))
-    for t in range T:
-        for l in range L:
+    prompt_length = prompt_image_mask.shape[0]
+    vision_attention_mass = []
+    text_attention_mass = []
+    attention_entropy_over_vision = []
 
+    for step_attentions in attentions:
+        per_step_vision_mass = []
+        per_step_text_mass = []
+        per_step_vision_entropy = []
+        for attn in step_attentions:
+            prompt_attention = attn[..., :prompt_length]
+            vision_attn = prompt_attention[..., prompt_image_mask]
+
+            vision_mass = vision_attn.sum(dim=-1)
+            vision_mass = vision_mass[..., -1]
+            per_step_vision_mass.append(vision_mass)
+
+            text_mass = prompt_attention[..., prompt_text_mask].sum(dim=-1)
+            text_mass = text_mass[..., -1]
+            per_step_text_mass.append(text_mass)
+
+            vision_mass_for_entropy = vision_attn.sum(dim=-1, keepdim=True)
+            vision_probs = vision_attn / vision_mass_for_entropy.clamp(min=1e-8)
+            vision_entropy = -(vision_probs * vision_probs.clamp(min=1e-8).log()).sum(dim=-1)
+            vision_entropy = vision_entropy[..., -1]
+            per_step_vision_entropy.append(vision_entropy)
+
+        per_step_vision_mass = torch.stack(per_step_vision_mass)
+        per_step_text_mass = torch.stack(per_step_text_mass)
+        per_step_vision_entropy = torch.stack(per_step_vision_entropy)
+        vision_attention_mass.append(
+            per_step_vision_mass.mean(dim=(1, 2))
+        )
+        text_attention_mass.append(
+            per_step_text_mass.mean(dim=(1, 2))
+        )
+        attention_entropy_over_vision.append(
+            per_step_vision_entropy.mean(dim=(1, 2))
+        )
+
+    return {
+        "vision_attention_mass": torch.stack(vision_attention_mass),
+        "text_attention_mass": torch.stack(text_attention_mass),
+        "attention_entropy_over_vision": torch.stack(attention_entropy_over_vision),
+    }

@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import asdict, is_dataclass
 import json
 import os
 import uuid
@@ -18,7 +19,6 @@ DEFAULT_SUBSETS = [
     "document",
     "general",
     "grounding",
-    "math",
     "scene",
     "spatial",
     "table",
@@ -169,6 +169,88 @@ def generation_to_saveable(generation: dict):
     return to_saveable(generation)
 
 
+def tensor_to_json_list(value):
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    return value
+
+
+def write_jsonl(path: Path, row: dict) -> None:
+    with path.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def build_answer_row(
+    *,
+    run_id: str,
+    subset: str,
+    sample: dict,
+    prompt: str,
+    condition: str,
+    intervention_config: dict,
+    generation: dict,
+) -> dict:
+    return {
+        "run_id": run_id,
+        "subset": subset,
+        "sample_id": sample["id"],
+        "condition": condition,
+        "intervention": intervention_config,
+        "prompt": prompt,
+        "generated_text": generation["generated_text"],
+        "generated_token_ids": tensor_to_json_list(generation["generated_token_ids"]),
+        "answer": sample.get("answer"),
+        "all_answers": sample.get("all_answers"),
+        "eval_mode": sample.get("eval_mode"),
+        "is_circular": sample.get("is_circular"),
+        "metadata": sample.get("metadata"),
+        "source_info": sample.get("source_info"),
+        "eval_metrics": sample.get("eval_metrics"),
+    }
+
+
+def score_answers(
+    *,
+    run_id: str,
+    run_dir: Path,
+    subset: str,
+    condition: str,
+    dataset,
+    answer_rows: list[dict],
+) -> None:
+    from datbench import DatBenchEvaluator, VLMResponse
+
+    if not answer_rows:
+        return
+
+    scores_dir = run_dir / "scores"
+    scores_dir.mkdir(exist_ok=True)
+
+    evaluator = DatBenchEvaluator(dataset, subset)
+    responses = [
+        VLMResponse(id=row["sample_id"], raw_output=row["generated_text"])
+        for row in answer_rows
+    ]
+    report = evaluator.compute_metrics(responses)
+    report_path = scores_dir / f"{subset}_{condition}.json"
+    report.save(str(report_path))
+
+    for result in report.results:
+        result_dict = asdict(result) if is_dataclass(result) else dict(result)
+        write_jsonl(
+            run_dir / "scores.jsonl",
+            {
+                "run_id": run_id,
+                "subset": subset,
+                "condition": condition,
+                "intervention": answer_rows[0]["intervention"],
+                **result_dict,
+            },
+        )
+
+
 def run(
     run_id: str,
     subsets: list[str],
@@ -181,7 +263,7 @@ def run(
     from datasets import load_dataset
     from tqdm import tqdm
 
-    from models.utils import compute_metrics
+    from models.utils import compute_metrics, compute_attention_metrics
 
     load_model, generate, generate_text_only, register_intervention = load_model_fns(
         model_name
@@ -206,11 +288,15 @@ def run(
     processor, model = load_model(device)
     model.eval()
     register_intervention(model, build_intervention(intervention_config))
+    answers_path = run_dir / "answers.jsonl"
     for subset in subsets:
         ds = load_dataset("DatologyAI/DatBench", subset, split="test")
         n = min(num_samples, len(ds))
+        subset_ds = ds.select(range(n))
+        real_answer_rows = []
+        textonly_answer_rows = []
 
-        for sample in tqdm(ds.select(range(n)), total=n, desc=subset):
+        for sample in tqdm(subset_ds, total=n, desc=subset):
             sample_id = sample["id"]
             sample_dir = run_dir / sample_id
             sample_dir.mkdir(parents=True, exist_ok=True)
@@ -219,6 +305,18 @@ def run(
             prompt = fmt["prefix"] + sample["question"] + fmt["suffix"]
 
             generation = generate(sample["image"], prompt, processor, model)
+            answer_row = build_answer_row(
+                run_id=run_id,
+                subset=subset,
+                sample=sample,
+                prompt=prompt,
+                condition="real",
+                intervention_config=intervention_config,
+                generation=generation,
+            )
+            write_jsonl(answers_path, answer_row)
+            real_answer_rows.append(answer_row)
+
             prefill_h = torch.stack(generation["hidden_states"][0], dim=0).squeeze(1)
             vision_h = prefill_h[:, generation["prompt_image_mask"], :]
             text_h = prefill_h[:, generation["prompt_text_mask"], :]
@@ -226,11 +324,29 @@ def run(
             tm = compute_metrics(text_h)
 
             textonly_generation = generate_text_only(prompt, processor, model)
+            textonly_answer_row = build_answer_row(
+                run_id=run_id,
+                subset=subset,
+                sample=sample,
+                prompt=prompt,
+                condition="textonly",
+                intervention_config=intervention_config,
+                generation=textonly_generation,
+            )
+            write_jsonl(answers_path, textonly_answer_row)
+            textonly_answer_rows.append(textonly_answer_row)
+
             textonly_h = torch.stack(
                 textonly_generation["hidden_states"][0], dim=0
             ).squeeze(1)
             textonly_h = textonly_h[:, textonly_generation["prompt_text_mask"], :]
             tom = compute_metrics(textonly_h)
+
+            attention_metrics = compute_attention_metrics(
+                generation["attentions"],
+                generation["prompt_image_mask"],
+                generation["prompt_text_mask"],
+            )
 
             torch.save(
                 to_saveable({
@@ -252,6 +368,16 @@ def run(
                     "textonly_cos": tom["cos"].cpu().float(),
                     "textonly_update_align": tom["update_align"].cpu().float(),
                     "textonly_adjacent_cos": tom["adjacent_cos"].cpu().float(),
+                    "vision_attention_mass": attention_metrics[
+                        "vision_attention_mass"
+                    ],
+                    "text_attention_mass": attention_metrics[
+                        "text_attention_mass"
+                    ],
+                    "attention_entropy_over_vision": attention_metrics[
+                        "attention_entropy_over_vision"
+                    ],
+                    "attention_metrics": attention_metrics,
                     "generation": generation_to_saveable(generation),
                     "textonly_generation": generation_to_saveable(
                         textonly_generation
@@ -259,6 +385,23 @@ def run(
                 }),
                 sample_dir / "metrics.pt",
             )
+
+        score_answers(
+            run_id=run_id,
+            run_dir=run_dir,
+            subset=subset,
+            condition="real",
+            dataset=subset_ds,
+            answer_rows=real_answer_rows,
+        )
+        score_answers(
+            run_id=run_id,
+            run_dir=run_dir,
+            subset=subset,
+            condition="textonly",
+            dataset=subset_ds,
+            answer_rows=textonly_answer_rows,
+        )
 
     return run_dir
 

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "datasets>=4.8.4",
+    "datbench",
     "matplotlib>=3.10.8",
     "modal>=1.4.1",
     "num2words>=0.5.14",
@@ -18,3 +19,6 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.uv.sources]
+datbench = { git = "https://github.com/bkal01/DatBench.git", rev = "c9b9de42015fccdca499a652d8d1a144e3a5d236" }
