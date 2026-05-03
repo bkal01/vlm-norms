@@ -1,0 +1,7 @@
+model: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+subsets: all
+num_samples: 10
+intervention:
+  type: scaled
+  alpha: 1.0
+  

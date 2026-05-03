@@ -18,6 +18,13 @@ For each sample we run two forward passes: one with the image, one text-only (sa
 
 ## Reproducing
 
+**Run locally** (saves results to `runs/<run_id>`):
+
+```bash
+uv run python run.py configs/smolvlm.yaml
+uv run python run.py configs/qwen3vl.yaml
+```
+
 **Run on Modal** (saves results to the `vlm-norms-runs` volume):
 
 ```bash

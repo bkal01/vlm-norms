@@ -32,3 +32,13 @@ def compute_metrics(h: torch.Tensor) -> dict[str, torch.Tensor]:
         "update_align": update_align,
         "adjacent_cos": adjacent_cos,
     }
+
+def compute_attention_metrics(
+        attentions,
+        V,
+):
+    # vision attention mass
+    vision_attention_mass = torch.zeros((T, L, ))
+    for t in range T:
+        for l in range L:
+

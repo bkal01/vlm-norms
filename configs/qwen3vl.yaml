@@ -1,0 +1,5 @@
+model: Qwen/Qwen3-VL-2B-Instruct
+subsets: all
+num_samples: 10
+intervention:
+  type: rms

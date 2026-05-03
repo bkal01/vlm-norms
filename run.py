@@ -4,7 +4,9 @@ import os
 import uuid
 from pathlib import Path
 
-from models.interventions import ScaledIntervention, RMSNormIntervention
+import yaml
+
+from models.interventions import RMSNormIntervention, ScaledIntervention
 
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -23,22 +25,113 @@ DEFAULT_SUBSETS = [
 ]
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+SUPPORTED_MODELS = [
+    "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+    "Qwen/Qwen3-VL-2B-Instruct",
+]
+SUPPORTED_INTERVENTIONS = ["rms", "scaled"]
 
 
-def parse_subsets(value: str) -> list[str]:
-    if value.strip().lower() == "all":
+def parse_subsets(value: str | list[str]) -> list[str]:
+    if isinstance(value, str) and value.strip().lower() == "all":
         return DEFAULT_SUBSETS.copy()
 
-    subsets = [subset.strip() for subset in value.split(",") if subset.strip()]
+    if isinstance(value, str):
+        subsets = [subset.strip() for subset in value.split(",") if subset.strip()]
+    elif isinstance(value, list):
+        subsets = value
+    else:
+        raise ValueError("subsets must be 'all', a comma-separated string, or a list")
+
+    if not all(isinstance(subset, str) for subset in subsets):
+        raise ValueError("subsets must contain only strings")
+
     unknown = sorted(set(subsets) - set(DEFAULT_SUBSETS))
     if unknown:
-        raise argparse.ArgumentTypeError(
+        raise ValueError(
             f"unknown subset(s): {', '.join(unknown)}; "
             f"expected any of: {', '.join(DEFAULT_SUBSETS)}"
         )
     if not subsets:
-        raise argparse.ArgumentTypeError("at least one subset is required")
+        raise ValueError("at least one subset is required")
     return subsets
+
+
+def parse_intervention(value: dict | str | None) -> dict:
+    if value is None:
+        return {"type": "rms"}
+
+    if isinstance(value, str):
+        value = {"type": value}
+    if not isinstance(value, dict):
+        raise ValueError("intervention must be a string or YAML mapping")
+
+    allowed_keys = {"type", "alpha"}
+    unknown_keys = sorted(set(value) - allowed_keys)
+    if unknown_keys:
+        raise ValueError(
+            f"unknown intervention key(s): {', '.join(unknown_keys)}; "
+            f"expected: {', '.join(sorted(allowed_keys))}"
+        )
+
+    intervention_type = value.get("type")
+    if intervention_type not in SUPPORTED_INTERVENTIONS:
+        raise ValueError(
+            f"unknown intervention type={intervention_type!r}; "
+            f"expected one of: {', '.join(SUPPORTED_INTERVENTIONS)}"
+        )
+
+    if intervention_type == "rms":
+        if "alpha" in value:
+            raise ValueError("intervention.alpha is only valid for type='scaled'")
+        return {"type": "rms"}
+
+    alpha = value.get("alpha")
+    if not isinstance(alpha, (int, float)):
+        raise ValueError("intervention.alpha must be a number for type='scaled'")
+
+    return {"type": "scaled", "alpha": float(alpha)}
+
+
+def build_intervention(config: dict):
+    if config["type"] == "rms":
+        return RMSNormIntervention()
+    if config["type"] == "scaled":
+        return ScaledIntervention(config["alpha"])
+    raise ValueError(f"unknown intervention type={config['type']!r}")
+
+
+def load_config(config_path: Path) -> dict:
+    raw_config = yaml.safe_load(config_path.read_text())
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"{config_path} must contain a YAML mapping")
+
+    allowed_keys = {"model", "subsets", "num_samples", "intervention"}
+    unknown_keys = sorted(set(raw_config) - allowed_keys)
+    if unknown_keys:
+        raise ValueError(
+            f"unknown config key(s): {', '.join(unknown_keys)}; "
+            f"expected: {', '.join(sorted(allowed_keys))}"
+        )
+
+    model_name = raw_config.get("model", DEFAULT_MODEL)
+    if model_name not in SUPPORTED_MODELS:
+        raise ValueError(
+            f"unknown model={model_name!r}; expected one of: {', '.join(SUPPORTED_MODELS)}"
+        )
+
+    num_samples = raw_config.get("num_samples", 10)
+    if not isinstance(num_samples, int):
+        raise ValueError("num_samples must be an integer")
+    if num_samples < 0:
+        raise ValueError("num_samples must be non-negative")
+
+    return {
+        "model": model_name,
+        "subsets": parse_subsets(raw_config.get("subsets", DEFAULT_SUBSETS.copy())),
+        "num_samples": num_samples,
+        "intervention": parse_intervention(raw_config.get("intervention")),
+    }
 
 
 def load_model_fns(model_name: str):
@@ -81,8 +174,8 @@ def run(
     subsets: list[str],
     num_samples: int,
     model_name: str,
-    runs_dir: Path,
-    overwrite: bool = False,
+    intervention_config: dict,
+    config_path: Path,
 ) -> Path:
     import torch
     from datasets import load_dataset
@@ -90,26 +183,21 @@ def run(
 
     from models.utils import compute_metrics
 
-    if num_samples < 0:
-        raise ValueError("num_samples must be non-negative")
-
     load_model, generate, generate_text_only, register_intervention = load_model_fns(
         model_name
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = runs_dir / run_id
-    if run_dir.exists() and any(run_dir.iterdir()) and not overwrite:
-        raise FileExistsError(
-            f"{run_dir} already exists and is not empty; use --overwrite or another --run-id"
-        )
+    run_dir = Path("runs") / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     config = {
         "run_id": run_id,
+        "config_path": str(config_path),
         "subsets": subsets,
         "num_samples_per_subset": num_samples,
         "model": model_name,
+        "intervention": intervention_config,
         "device": str(device),
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
     }
@@ -117,7 +205,7 @@ def run(
 
     processor, model = load_model(device)
     model.eval()
-    register_intervention(model, RMSNormIntervention())
+    register_intervention(model, build_intervention(intervention_config))
     for subset in subsets:
         ds = load_dataset("DatologyAI/DatBench", subset, split="test")
         n = min(num_samples, len(ds))
@@ -180,56 +268,26 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run VLM norm collection locally without Modal."
     )
     parser.add_argument(
-        "--subsets",
-        type=parse_subsets,
-        default=DEFAULT_SUBSETS.copy(),
-        help="Comma-separated DatBench subsets, or 'all'.",
-    )
-    parser.add_argument(
-        "--num-samples",
-        type=int,
-        default=10,
-        help="Number of samples to run per subset.",
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        choices=[
-            "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
-            "Qwen/Qwen3-VL-2B-Instruct",
-        ],
-        help="Model to run.",
-    )
-    parser.add_argument(
-        "--run-id",
-        default=None,
-        help="Output run id. Defaults to a new UUID.",
-    )
-    parser.add_argument(
-        "--runs-dir",
+        "config",
         type=Path,
-        default=Path("runs"),
-        help="Directory where run artifacts are written.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Allow writing into an existing non-empty run directory.",
+        help="YAML config file path.",
     )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    run_id = args.run_id or str(uuid.uuid4())
+    config_path = args.config
+    config = load_config(config_path)
+    run_id = str(uuid.uuid4())
 
     run_dir = run(
         run_id=run_id,
-        subsets=args.subsets,
-        num_samples=args.num_samples,
-        model_name=args.model,
-        runs_dir=args.runs_dir,
-        overwrite=args.overwrite,
+        subsets=config["subsets"],
+        num_samples=config["num_samples"],
+        model_name=config["model"],
+        intervention_config=config["intervention"],
+        config_path=config_path,
     )
 
     print(f"run_id={run_id}")
