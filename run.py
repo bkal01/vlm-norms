@@ -26,7 +26,7 @@ DEFAULT_SUBSETS = [
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 DEFAULT_MAX_NEW_TOKENS = 64
-DEFAULT_ALPHAS = [0.03, 0.1, 0.3, 1.0, 3.0]
+DEFAULT_ALPHAS = [0.01, 0.03, 0.05, 0.07, 0.1, 0.3, 1.0, 3.0]
 SUPPORTED_MODELS = [
     "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
     "Qwen/Qwen3-VL-2B-Instruct",

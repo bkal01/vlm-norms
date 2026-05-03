@@ -35,7 +35,7 @@ subsets: counting
 num_samples: 1
 intervention:
   type: scaled
-  alphas: [0.03, 0.1, 0.3, 1.0, 3.0]
+  alphas: [0.01, 0.03, 0.05, 0.07, 0.1, 0.3, 1.0, 3.0]
 ```
 
 `alpha = 1.0` is required because downstream analysis treats it as the paired
@@ -48,7 +48,10 @@ reports to `runs/<run_id>/scores/<subset>_<condition>.json`.
 Per-sample tensor artifacts are saved as:
 
 ```text
+runs/<run_id>/<subset>/<sample_id>/alpha_0.01/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_0.03/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/alpha_0.05/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/alpha_0.07/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_0.1/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_0.3/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_1/metrics.pt
