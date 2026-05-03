@@ -14,7 +14,9 @@ VLM adapters (vision connectors) output tokens with much higher L2 norms than th
 - **Benchmark**: [DatBench](https://huggingface.co/datasets/DatologyAI/DatBench) — 9 categories (chart, counting, document, general, grounding, math, scene, spatial, table), generative format, vision-necessary questions
 - **Compute**: Modal (A10G GPU), results saved to a Modal Volume and pulled locally
 
-For each sample we run two forward passes: one with the image, one text-only (same prompt, no image). This lets us isolate whether any observed text token dynamics are caused by vision tokens or are intrinsic to the LLM.
+For each sample, the local runner sweeps visual-token scale factors before the
+LLM blocks and also runs one text-only condition. This supports paired
+comparisons against the `alpha = 1.0` baseline.
 
 ## Reproducing
 
@@ -25,11 +27,43 @@ uv run python run.py configs/smolvlm.yaml
 uv run python run.py configs/qwen3vl.yaml
 ```
 
-Each local run now writes raw generated answers to `runs/<run_id>/answers.jsonl`,
-DatBench per-sample scores to `runs/<run_id>/scores.jsonl`, and DatBench native
-reports to `runs/<run_id>/scores/<subset>_{real,textonly}.json`.
+Configs use an alpha sweep:
 
-**Run on Modal** (saves results to the `vlm-norms-runs` volume):
+```yaml
+model: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+subsets: counting
+num_samples: 1
+intervention:
+  type: scaled
+  alphas: [0.03, 0.1, 0.3, 1.0, 3.0]
+```
+
+`alpha = 1.0` is required because downstream analysis treats it as the paired
+baseline.
+
+Each local run writes raw generated answers to `runs/<run_id>/answers.jsonl`,
+DatBench per-sample scores to `runs/<run_id>/scores.jsonl`, and DatBench native
+reports to `runs/<run_id>/scores/<subset>_<condition>.json`.
+
+Per-sample tensor artifacts are saved as:
+
+```text
+runs/<run_id>/<subset>/<sample_id>/alpha_0.03/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/alpha_0.1/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/alpha_0.3/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/alpha_1/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/alpha_3/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/textonly/metrics.pt
+```
+
+Real-image rows in `answers.jsonl` and `scores.jsonl` include an `alpha` field
+and conditions such as `real_alpha_0.3`. Text-only rows use `condition:
+textonly` and `alpha: null`.
+
+Inside `metrics.pt`, Hugging Face generation scores are stored under
+`generation["generation_scores"]` to avoid confusion with DatBench score files.
+
+**Run on Modal** (legacy runner; saves results to the `vlm-norms-runs` volume):
 
 ```bash
 modal run modal_run.py --num-samples 10

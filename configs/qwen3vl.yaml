@@ -2,4 +2,5 @@ model: Qwen/Qwen3-VL-2B-Instruct
 subsets: all
 num_samples: 10
 intervention:
-  type: rms
+  type: scaled
+  alphas: [0.03, 0.1, 0.3, 1.0, 3.0]

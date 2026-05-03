@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from models.interventions import RMSNormIntervention, ScaledIntervention
+from models.interventions import ScaledIntervention
 
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -25,11 +25,12 @@ DEFAULT_SUBSETS = [
 ]
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+DEFAULT_ALPHAS = [0.03, 0.1, 0.3, 1.0, 3.0]
 SUPPORTED_MODELS = [
     "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
     "Qwen/Qwen3-VL-2B-Instruct",
 ]
-SUPPORTED_INTERVENTIONS = ["rms", "scaled"]
+SUPPORTED_INTERVENTIONS = ["scaled"]
 
 
 def parse_subsets(value: str | list[str]) -> list[str]:
@@ -57,16 +58,14 @@ def parse_subsets(value: str | list[str]) -> list[str]:
     return subsets
 
 
-def parse_intervention(value: dict | str | None) -> dict:
+def parse_intervention(value: dict | None) -> dict:
     if value is None:
-        return {"type": "rms"}
+        return {"type": "scaled", "alphas": DEFAULT_ALPHAS.copy()}
 
-    if isinstance(value, str):
-        value = {"type": value}
     if not isinstance(value, dict):
-        raise ValueError("intervention must be a string or YAML mapping")
+        raise ValueError("intervention must be a YAML mapping")
 
-    allowed_keys = {"type", "alpha"}
+    allowed_keys = {"type", "alphas"}
     unknown_keys = sorted(set(value) - allowed_keys)
     if unknown_keys:
         raise ValueError(
@@ -81,24 +80,31 @@ def parse_intervention(value: dict | str | None) -> dict:
             f"expected one of: {', '.join(SUPPORTED_INTERVENTIONS)}"
         )
 
-    if intervention_type == "rms":
-        if "alpha" in value:
-            raise ValueError("intervention.alpha is only valid for type='scaled'")
-        return {"type": "rms"}
+    alphas = value.get("alphas", DEFAULT_ALPHAS.copy())
+    if not isinstance(alphas, list):
+        raise ValueError("intervention.alphas must be a list of numbers")
+    if not alphas:
+        raise ValueError("intervention.alphas must not be empty")
+    if not all(isinstance(alpha, (int, float)) for alpha in alphas):
+        raise ValueError("intervention.alphas must contain only numbers")
 
-    alpha = value.get("alpha")
-    if not isinstance(alpha, (int, float)):
-        raise ValueError("intervention.alpha must be a number for type='scaled'")
+    alphas = [float(alpha) for alpha in alphas]
+    if 1.0 not in alphas:
+        raise ValueError("intervention.alphas must include 1.0 as the baseline")
 
-    return {"type": "scaled", "alpha": float(alpha)}
+    return {"type": "scaled", "alphas": alphas}
 
 
-def build_intervention(config: dict):
-    if config["type"] == "rms":
-        return RMSNormIntervention()
-    if config["type"] == "scaled":
-        return ScaledIntervention(config["alpha"])
-    raise ValueError(f"unknown intervention type={config['type']!r}")
+def build_intervention(alpha: float):
+    return ScaledIntervention(alpha)
+
+
+def alpha_label(alpha: float) -> str:
+    return f"{alpha:g}"
+
+
+def alpha_dir_name(alpha: float) -> str:
+    return f"alpha_{alpha_label(alpha)}"
 
 
 def load_config(config_path: Path) -> dict:
@@ -164,8 +170,12 @@ def to_saveable(value):
 
 def generation_to_saveable(generation: dict):
     generation = dict(generation)
-    if generation.get("scores", None) is not None:
-        generation["logits"] = None
+    generation_scores = generation.pop("scores", None)
+    if generation_scores is not None:
+        generation["generation_scores"] = generation_scores
+    generation_logits = generation.pop("logits", None)
+    if generation_logits is not None:
+        generation["generation_logits"] = generation_logits
     return to_saveable(generation)
 
 
@@ -197,6 +207,7 @@ def build_answer_row(
         "subset": subset,
         "sample_id": sample["id"],
         "condition": condition,
+        "alpha": intervention_config.get("alpha"),
         "intervention": intervention_config,
         "prompt": prompt,
         "generated_text": generation["generated_text"],
@@ -245,6 +256,7 @@ def score_answers(
                 "run_id": run_id,
                 "subset": subset,
                 "condition": condition,
+                "alpha": answer_rows[0].get("alpha"),
                 "intervention": answer_rows[0]["intervention"],
                 **result_dict,
             },
@@ -287,50 +299,103 @@ def run(
 
     processor, model = load_model(device)
     model.eval()
-    register_intervention(model, build_intervention(intervention_config))
+    alphas = intervention_config["alphas"]
+    intervention = build_intervention(alphas[0])
+    register_intervention(model, intervention)
     answers_path = run_dir / "answers.jsonl"
     for subset in subsets:
         ds = load_dataset("DatologyAI/DatBench", subset, split="test")
         n = min(num_samples, len(ds))
         subset_ds = ds.select(range(n))
-        real_answer_rows = []
+        real_answer_rows_by_alpha = {alpha: [] for alpha in alphas}
         textonly_answer_rows = []
 
         for sample in tqdm(subset_ds, total=n, desc=subset):
             sample_id = sample["id"]
-            sample_dir = run_dir / sample_id
+            sample_dir = run_dir / subset / sample_id
             sample_dir.mkdir(parents=True, exist_ok=True)
 
             fmt = sample["prompt_format"]
             prompt = fmt["prefix"] + sample["question"] + fmt["suffix"]
 
-            generation = generate(sample["image"], prompt, processor, model)
-            answer_row = build_answer_row(
-                run_id=run_id,
-                subset=subset,
-                sample=sample,
-                prompt=prompt,
-                condition="real",
-                intervention_config=intervention_config,
-                generation=generation,
-            )
-            write_jsonl(answers_path, answer_row)
-            real_answer_rows.append(answer_row)
+            for alpha in alphas:
+                intervention.alpha = alpha
+                alpha_intervention_config = {"type": "scaled", "alpha": alpha}
+                condition = f"real_alpha_{alpha_label(alpha)}"
+                alpha_dir = sample_dir / alpha_dir_name(alpha)
+                alpha_dir.mkdir(parents=True, exist_ok=True)
 
-            prefill_h = torch.stack(generation["hidden_states"][0], dim=0).squeeze(1)
-            vision_h = prefill_h[:, generation["prompt_image_mask"], :]
-            text_h = prefill_h[:, generation["prompt_text_mask"], :]
-            vm = compute_metrics(vision_h)
-            tm = compute_metrics(text_h)
+                generation = generate(sample["image"], prompt, processor, model)
+                answer_row = build_answer_row(
+                    run_id=run_id,
+                    subset=subset,
+                    sample=sample,
+                    prompt=prompt,
+                    condition=condition,
+                    intervention_config=alpha_intervention_config,
+                    generation=generation,
+                )
+                write_jsonl(answers_path, answer_row)
+                real_answer_rows_by_alpha[alpha].append(answer_row)
+
+                prefill_h = torch.stack(
+                    generation["hidden_states"][0], dim=0
+                ).squeeze(1)
+                vision_h = prefill_h[:, generation["prompt_image_mask"], :]
+                text_h = prefill_h[:, generation["prompt_text_mask"], :]
+                vm = compute_metrics(vision_h)
+                tm = compute_metrics(text_h)
+
+                attention_metrics = compute_attention_metrics(
+                    generation["attentions"],
+                    generation["prompt_image_mask"],
+                    generation["prompt_text_mask"],
+                )
+
+                torch.save(
+                    to_saveable({
+                        "run_id": run_id,
+                        "subset": subset,
+                        "sample_id": sample_id,
+                        "condition": condition,
+                        "alpha": alpha,
+                        "intervention": alpha_intervention_config,
+                        "vision_norms": vm["norms"].cpu().float(),
+                        "vision_abs": vm["abs"].cpu().float(),
+                        "vision_rel": vm["rel"].cpu().float(),
+                        "vision_cos": vm["cos"].cpu().float(),
+                        "vision_update_align": vm["update_align"].cpu().float(),
+                        "vision_adjacent_cos": vm["adjacent_cos"].cpu().float(),
+                        "text_norms": tm["norms"].cpu().float(),
+                        "text_abs": tm["abs"].cpu().float(),
+                        "text_rel": tm["rel"].cpu().float(),
+                        "text_cos": tm["cos"].cpu().float(),
+                        "text_update_align": tm["update_align"].cpu().float(),
+                        "text_adjacent_cos": tm["adjacent_cos"].cpu().float(),
+                        "vision_attention_mass": attention_metrics[
+                            "vision_attention_mass"
+                        ],
+                        "text_attention_mass": attention_metrics[
+                            "text_attention_mass"
+                        ],
+                        "attention_entropy_over_vision": attention_metrics[
+                            "attention_entropy_over_vision"
+                        ],
+                        "attention_metrics": attention_metrics,
+                        "generation": generation_to_saveable(generation),
+                    }),
+                    alpha_dir / "metrics.pt",
+                )
 
             textonly_generation = generate_text_only(prompt, processor, model)
+            textonly_intervention_config = {"type": "textonly", "alpha": None}
             textonly_answer_row = build_answer_row(
                 run_id=run_id,
                 subset=subset,
                 sample=sample,
                 prompt=prompt,
                 condition="textonly",
-                intervention_config=intervention_config,
+                intervention_config=textonly_intervention_config,
                 generation=textonly_generation,
             )
             write_jsonl(answers_path, textonly_answer_row)
@@ -342,58 +407,38 @@ def run(
             textonly_h = textonly_h[:, textonly_generation["prompt_text_mask"], :]
             tom = compute_metrics(textonly_h)
 
-            attention_metrics = compute_attention_metrics(
-                generation["attentions"],
-                generation["prompt_image_mask"],
-                generation["prompt_text_mask"],
-            )
-
+            textonly_dir = sample_dir / "textonly"
+            textonly_dir.mkdir(parents=True, exist_ok=True)
             torch.save(
                 to_saveable({
-                    "vision_norms": vm["norms"].cpu().float(),
-                    "vision_abs": vm["abs"].cpu().float(),
-                    "vision_rel": vm["rel"].cpu().float(),
-                    "vision_cos": vm["cos"].cpu().float(),
-                    "vision_update_align": vm["update_align"].cpu().float(),
-                    "vision_adjacent_cos": vm["adjacent_cos"].cpu().float(),
-                    "text_norms": tm["norms"].cpu().float(),
-                    "text_abs": tm["abs"].cpu().float(),
-                    "text_rel": tm["rel"].cpu().float(),
-                    "text_cos": tm["cos"].cpu().float(),
-                    "text_update_align": tm["update_align"].cpu().float(),
-                    "text_adjacent_cos": tm["adjacent_cos"].cpu().float(),
+                    "run_id": run_id,
+                    "subset": subset,
+                    "sample_id": sample_id,
+                    "condition": "textonly",
+                    "alpha": None,
+                    "intervention": textonly_intervention_config,
                     "textonly_norms": tom["norms"].cpu().float(),
                     "textonly_abs": tom["abs"].cpu().float(),
                     "textonly_rel": tom["rel"].cpu().float(),
                     "textonly_cos": tom["cos"].cpu().float(),
                     "textonly_update_align": tom["update_align"].cpu().float(),
                     "textonly_adjacent_cos": tom["adjacent_cos"].cpu().float(),
-                    "vision_attention_mass": attention_metrics[
-                        "vision_attention_mass"
-                    ],
-                    "text_attention_mass": attention_metrics[
-                        "text_attention_mass"
-                    ],
-                    "attention_entropy_over_vision": attention_metrics[
-                        "attention_entropy_over_vision"
-                    ],
-                    "attention_metrics": attention_metrics,
-                    "generation": generation_to_saveable(generation),
                     "textonly_generation": generation_to_saveable(
                         textonly_generation
                     ),
                 }),
-                sample_dir / "metrics.pt",
+                textonly_dir / "metrics.pt",
             )
 
-        score_answers(
-            run_id=run_id,
-            run_dir=run_dir,
-            subset=subset,
-            condition="real",
-            dataset=subset_ds,
-            answer_rows=real_answer_rows,
-        )
+        for alpha, real_answer_rows in real_answer_rows_by_alpha.items():
+            score_answers(
+                run_id=run_id,
+                run_dir=run_dir,
+                subset=subset,
+                condition=f"real_alpha_{alpha_label(alpha)}",
+                dataset=subset_ds,
+                answer_rows=real_answer_rows,
+            )
         score_answers(
             run_id=run_id,
             run_dir=run_dir,
