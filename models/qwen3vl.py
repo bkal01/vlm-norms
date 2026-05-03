@@ -229,8 +229,20 @@ def generate_text_only(
 
 def register_intervention(model, intervention):
     orig_get_image_features = model.model.get_image_features
+
+    def apply_intervention(features):
+        if features is None:
+            return None
+        if isinstance(features, tuple):
+            return tuple(intervention.reduce_norm(feature) for feature in features)
+        if isinstance(features, list):
+            return [intervention.reduce_norm(feature) for feature in features]
+        return intervention.reduce_norm(features)
+
     def patch(*args, **kwargs):
         out = orig_get_image_features(*args, **kwargs)
-        out.last_hidden_state = intervention.reduce_norm(out.last_hidden_state)
+        out.pooler_output = apply_intervention(out.pooler_output)
+        out.deepstack_features = apply_intervention(out.deepstack_features)
         return out
+
     model.model.get_image_features = patch
