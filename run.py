@@ -25,6 +25,7 @@ DEFAULT_SUBSETS = [
 ]
 
 DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+DEFAULT_MAX_NEW_TOKENS = 64
 DEFAULT_ALPHAS = [0.03, 0.1, 0.3, 1.0, 3.0]
 SUPPORTED_MODELS = [
     "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
@@ -290,6 +291,7 @@ def run(
         "config_path": str(config_path),
         "subsets": subsets,
         "num_samples_per_subset": num_samples,
+        "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
         "model": model_name,
         "intervention": intervention_config,
         "device": str(device),
@@ -325,7 +327,13 @@ def run(
                 alpha_dir = sample_dir / alpha_dir_name(alpha)
                 alpha_dir.mkdir(parents=True, exist_ok=True)
 
-                generation = generate(sample["image"], prompt, processor, model)
+                generation = generate(
+                    sample["image"],
+                    prompt,
+                    processor,
+                    model,
+                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                )
                 answer_row = build_answer_row(
                     run_id=run_id,
                     subset=subset,
@@ -387,7 +395,12 @@ def run(
                     alpha_dir / "metrics.pt",
                 )
 
-            textonly_generation = generate_text_only(prompt, processor, model)
+            textonly_generation = generate_text_only(
+                prompt,
+                processor,
+                model,
+                max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+            )
             textonly_intervention_config = {"type": "textonly", "alpha": None}
             textonly_answer_row = build_answer_row(
                 run_id=run_id,
