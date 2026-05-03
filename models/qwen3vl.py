@@ -3,8 +3,16 @@ from PIL import Image
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 
+QWEN3VL_MAX_VISUAL_TOKENS = 1024
+QWEN3VL_PIXELS_PER_VISUAL_TOKEN = 28 * 28
+QWEN3VL_MAX_PIXELS = QWEN3VL_MAX_VISUAL_TOKENS * QWEN3VL_PIXELS_PER_VISUAL_TOKEN
+
+
 def load_model(device: torch.device):
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen3-VL-2B-Instruct",
+        max_pixels=QWEN3VL_MAX_PIXELS,
+    )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         "Qwen/Qwen3-VL-2B-Instruct",
         dtype=torch.bfloat16,

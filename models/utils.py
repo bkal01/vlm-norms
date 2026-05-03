@@ -148,6 +148,103 @@ def compute_logit_sensitivity_rows(
     return rows
 
 
+def compute_logit_comparison_rows(
+    *,
+    subset: str,
+    sample_id: str,
+    comparison: str,
+    condition: str,
+    reference_condition: str,
+    alpha: float | None,
+    reference_alpha: float | None,
+    logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+    reference_generated_token_ids: torch.Tensor | None = None,
+) -> list[dict]:
+    if logits.shape[-1] != reference_logits.shape[-1]:
+        return []
+
+    n_steps = min(logits.shape[0], reference_logits.shape[0])
+    if reference_generated_token_ids is not None:
+        n_steps = min(n_steps, reference_generated_token_ids.shape[0])
+
+    logits = logits[:n_steps]
+    reference_prefix = reference_logits[:n_steps]
+
+    logp = torch.log_softmax(logits, dim=-1)
+    logq = torch.log_softmax(reference_prefix, dim=-1)
+    p = logp.exp()
+    kl = (p * (logp - logq)).sum(dim=-1)
+
+    greedy_token = logits.argmax(dim=-1)
+    reference_greedy_token = reference_prefix.argmax(dim=-1)
+    greedy_agreement = greedy_token == reference_greedy_token
+
+    reference_token_ids = None
+    reference_token_prob = None
+    reference_token_rank = None
+    if reference_generated_token_ids is not None:
+        reference_token_ids = reference_generated_token_ids[:n_steps].long()
+        reference_token_logp = logp.gather(1, reference_token_ids[:, None]).squeeze(1)
+        reference_token_prob = reference_token_logp.exp()
+        reference_token_logits = logits.gather(1, reference_token_ids[:, None]).squeeze(1)
+        reference_token_rank = (logits > reference_token_logits[:, None]).sum(dim=-1) + 1
+
+    rows = []
+    for step in range(n_steps):
+        row = {
+            "subset": subset,
+            "sample_id": sample_id,
+            "comparison": comparison,
+            "condition": condition,
+            "reference_condition": reference_condition,
+            "alpha": None if alpha is None else float(alpha),
+            "reference_alpha": None
+            if reference_alpha is None
+            else float(reference_alpha),
+            "step": step,
+            "kl": float(kl[step]),
+            "greedy_token_id": int(greedy_token[step]),
+            "reference_greedy_token_id": int(reference_greedy_token[step]),
+            "greedy_agreement": int(greedy_agreement[step]),
+        }
+        if reference_token_ids is not None:
+            row.update(
+                {
+                    "reference_token_id": int(reference_token_ids[step]),
+                    "reference_token_prob": float(reference_token_prob[step]),
+                    "reference_token_rank": int(reference_token_rank[step]),
+                }
+            )
+        rows.append(row)
+    return rows
+
+
+def compute_logit_kl_stats(
+    logits: torch.Tensor | None,
+    reference_logits: torch.Tensor | None,
+) -> dict[str, float | int | None]:
+    if logits is None or reference_logits is None:
+        return {"mean_kl": None, "max_kl": None, "n_steps": 0}
+    if logits.shape[-1] != reference_logits.shape[-1]:
+        return {"mean_kl": None, "max_kl": None, "n_steps": 0}
+
+    n_steps = min(logits.shape[0], reference_logits.shape[0])
+    if n_steps == 0:
+        return {"mean_kl": None, "max_kl": None, "n_steps": 0}
+
+    logits = logits[:n_steps]
+    reference_prefix = reference_logits[:n_steps]
+    logp = torch.log_softmax(logits, dim=-1)
+    logq = torch.log_softmax(reference_prefix, dim=-1)
+    kl = (logp.exp() * (logp - logq)).sum(dim=-1)
+    return {
+        "mean_kl": float(kl.mean()),
+        "max_kl": float(kl.max()),
+        "n_steps": int(n_steps),
+    }
+
+
 def extract_vision_attention(generation: dict) -> torch.Tensor | None:
     attentions = generation.get("attentions")
     if attentions is None:

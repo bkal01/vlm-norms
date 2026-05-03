@@ -15,8 +15,10 @@ VLM adapters (vision connectors) output tokens with much higher L2 norms than th
 - **Compute**: Modal (A10G GPU), results saved to a Modal Volume and pulled locally
 
 For each sample, the local runner sweeps visual-token scale factors before the
-LLM blocks and also runs one text-only condition. This supports paired
-comparisons against the `alpha = 1.0` baseline.
+LLM blocks, runs matched blank-image controls for each scale factor, and also
+runs one text-only condition. This supports paired comparisons against the
+`alpha = 1.0` baseline and real-image comparisons against blank/text-only
+controls without storing raw generation tensors.
 
 ## Reproducing
 
@@ -45,6 +47,35 @@ Each local run writes raw generated answers to `runs/<run_id>/answers.jsonl`,
 DatBench per-sample scores to `runs/<run_id>/scores.jsonl`, and DatBench native
 reports to `runs/<run_id>/scores/<subset>_<condition>.json`.
 
+The runner also precomputes scalar logit-control artifacts:
+
+```text
+runs/<run_id>/logit_sensitivity.jsonl
+runs/<run_id>/condition_logit_comparisons.jsonl
+runs/<run_id>/vision_sensitivity.jsonl
+```
+
+`logit_sensitivity.jsonl` compares real-image alpha conditions against
+`real_alpha_1`. `condition_logit_comparisons.jsonl` contains per-generated-step
+KL and greedy-token agreement rows for:
+
+```text
+real_vs_blank_same_alpha
+real_vs_blank_alpha_1
+real_vs_textonly
+blank_vs_textonly
+```
+
+`vision_sensitivity.jsonl` contains one row per sample with baseline
+`real_alpha_1` vs `blank_alpha_1` and text-only KL summaries, generated-text
+differences, and a `keep_for_intervention_sweep` flag.
+
+Summarize condition-control KLs with:
+
+```bash
+uv run scripts/summarize_condition_logit_comparisons.py <run_id>
+```
+
 Per-sample tensor artifacts are saved as:
 
 ```text
@@ -56,15 +87,20 @@ runs/<run_id>/<subset>/<sample_id>/alpha_0.1/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_0.3/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_1/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/alpha_3/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_0.01/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_0.03/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_0.05/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_0.07/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_0.1/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_0.3/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_1/metrics.pt
+runs/<run_id>/<subset>/<sample_id>/blank_alpha_3/metrics.pt
 runs/<run_id>/<subset>/<sample_id>/textonly/metrics.pt
 ```
 
-Real-image rows in `answers.jsonl` and `scores.jsonl` include an `alpha` field
-and conditions such as `real_alpha_0.3`. Text-only rows use `condition:
-textonly` and `alpha: null`.
-
-Inside `metrics.pt`, Hugging Face generation scores are stored under
-`generation["generation_scores"]` to avoid confusion with DatBench score files.
+Real-image and blank-image rows in `answers.jsonl` and `scores.jsonl` include an
+`alpha` field and conditions such as `real_alpha_0.3` and `blank_alpha_0.3`.
+Text-only rows use `condition: textonly` and `alpha: null`.
 
 **Run on Modal** (legacy runner; saves results to the `vlm-norms-runs` volume):
 

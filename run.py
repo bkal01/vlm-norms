@@ -27,6 +27,7 @@ DEFAULT_SUBSETS = [
 DEFAULT_MODEL = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 DEFAULT_MAX_NEW_TOKENS = 64
 DEFAULT_ALPHAS = [0.01, 0.03, 0.05, 0.07, 0.1, 0.3, 1.0, 3.0]
+IMAGE_SENSITIVITY_KL_THRESHOLD = 0.1
 SUPPORTED_MODELS = [
     "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
     "Qwen/Qwen3-VL-2B-Instruct",
@@ -100,12 +101,22 @@ def build_intervention(alpha: float):
     return ScaledIntervention(alpha)
 
 
+def blank_image_like(image):
+    from PIL import Image
+
+    return Image.new("RGB", image.size, color=(255, 255, 255))
+
+
 def alpha_label(alpha: float) -> str:
     return f"{alpha:g}"
 
 
 def alpha_dir_name(alpha: float) -> str:
     return f"alpha_{alpha_label(alpha)}"
+
+
+def condition_name(prefix: str, alpha: float) -> str:
+    return f"{prefix}_alpha_{alpha_label(alpha)}"
 
 
 def load_config(config_path: Path) -> dict:
@@ -261,6 +272,98 @@ def score_answers(
         )
 
 
+def collect_multimodal_condition(
+    *,
+    run_id: str,
+    run_dir: Path,
+    subset: str,
+    sample: dict,
+    prompt: str,
+    image,
+    condition: str,
+    condition_dir_name: str,
+    intervention_config: dict,
+    generate,
+    processor,
+    model,
+    max_new_tokens: int,
+    answers_path: Path,
+) -> tuple[dict, dict]:
+    import torch
+
+    from models.utils import compute_attention_metrics, compute_metrics
+
+    sample_id = sample["id"]
+    condition_dir = run_dir / subset / sample_id / condition_dir_name
+    condition_dir.mkdir(parents=True, exist_ok=True)
+
+    generation = generate(
+        image,
+        prompt,
+        processor,
+        model,
+        max_new_tokens=max_new_tokens,
+    )
+    answer_row = build_answer_row(
+        run_id=run_id,
+        subset=subset,
+        sample=sample,
+        prompt=prompt,
+        condition=condition,
+        intervention_config=intervention_config,
+        generation=generation,
+    )
+    write_jsonl(answers_path, answer_row)
+
+    prefill_h = torch.stack(generation["hidden_states"][0], dim=0).squeeze(1)
+    vision_h = prefill_h[:, generation["prompt_image_mask"], :]
+    text_h = prefill_h[:, generation["prompt_text_mask"], :]
+    vm = compute_metrics(vision_h)
+    tm = compute_metrics(text_h)
+
+    attention_metrics = compute_attention_metrics(
+        generation["attentions"],
+        generation["prompt_image_mask"],
+        generation["prompt_text_mask"],
+    )
+    generated_token_ids = generation["generated_token_ids"].detach().cpu()
+
+    torch.save(
+        to_saveable({
+            "run_id": run_id,
+            "subset": subset,
+            "sample_id": sample_id,
+            "condition": condition,
+            "alpha": intervention_config.get("alpha"),
+            "intervention": intervention_config,
+            "vision_norms": vm["norms"].cpu().float(),
+            "vision_abs": vm["abs"].cpu().float(),
+            "vision_rel": vm["rel"].cpu().float(),
+            "vision_cos": vm["cos"].cpu().float(),
+            "vision_update_align": vm["update_align"].cpu().float(),
+            "vision_adjacent_cos": vm["adjacent_cos"].cpu().float(),
+            "text_norms": tm["norms"].cpu().float(),
+            "text_abs": tm["abs"].cpu().float(),
+            "text_rel": tm["rel"].cpu().float(),
+            "text_cos": tm["cos"].cpu().float(),
+            "text_update_align": tm["update_align"].cpu().float(),
+            "text_adjacent_cos": tm["adjacent_cos"].cpu().float(),
+            "vision_attention_mass": attention_metrics["vision_attention_mass"],
+            "text_attention_mass": attention_metrics["text_attention_mass"],
+            "attention_entropy_over_vision": attention_metrics[
+                "attention_entropy_over_vision"
+            ],
+            "generated_token_ids": generated_token_ids,
+            "prompt_length": generation["prompt_length"],
+            "prompt_image_token_count": int(generation["prompt_image_mask"].sum()),
+            "prompt_text_token_count": int(generation["prompt_text_mask"].sum()),
+        }),
+        condition_dir / "metrics.pt",
+    )
+
+    return answer_row, generation
+
+
 def run(
     run_id: str,
     subsets: list[str],
@@ -275,7 +378,8 @@ def run(
 
     from models.utils import (
         compute_attention_divergence_rows,
-        compute_attention_metrics,
+        compute_logit_comparison_rows,
+        compute_logit_kl_stats,
         compute_logit_sensitivity_rows,
         compute_metrics,
         extract_vision_attention,
@@ -310,6 +414,8 @@ def run(
     register_intervention(model, intervention)
     answers_path = run_dir / "answers.jsonl"
     logit_sensitivity_path = run_dir / "logit_sensitivity.jsonl"
+    condition_logit_comparisons_path = run_dir / "condition_logit_comparisons.jsonl"
+    vision_sensitivity_path = run_dir / "vision_sensitivity.jsonl"
     attention_divergence_path = run_dir / "attention_divergence_from_baseline.jsonl"
     baseline_alpha = 1.0
     ordered_alphas = [baseline_alpha] + [
@@ -320,6 +426,7 @@ def run(
         n = min(num_samples, len(ds))
         subset_ds = ds.select(range(n))
         real_answer_rows_by_alpha = {alpha: [] for alpha in alphas}
+        blank_answer_rows_by_alpha = {alpha: [] for alpha in alphas}
         textonly_answer_rows = []
 
         for sample in tqdm(subset_ds, total=n, desc=subset):
@@ -333,49 +440,41 @@ def run(
             baseline_logits = None
             baseline_generated_token_ids = None
             baseline_vision_attention = None
+            blank_baseline_logits = None
+            blank_baseline_generated_token_ids = None
+            real_logits_by_alpha = {}
+            real_answers_by_alpha = {}
+            blank_logits_by_alpha = {}
+            blank_answers_by_alpha = {}
 
             for alpha in ordered_alphas:
                 intervention.alpha = alpha
                 alpha_intervention_config = {"type": "scaled", "alpha": alpha}
-                condition = f"real_alpha_{alpha_label(alpha)}"
-                alpha_dir = sample_dir / alpha_dir_name(alpha)
-                alpha_dir.mkdir(parents=True, exist_ok=True)
-
-                generation = generate(
-                    sample["image"],
-                    prompt,
-                    processor,
-                    model,
-                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-                )
-                answer_row = build_answer_row(
+                condition = condition_name("real", alpha)
+                answer_row, generation = collect_multimodal_condition(
                     run_id=run_id,
+                    run_dir=run_dir,
                     subset=subset,
                     sample=sample,
                     prompt=prompt,
+                    image=sample["image"],
                     condition=condition,
+                    condition_dir_name=alpha_dir_name(alpha),
                     intervention_config=alpha_intervention_config,
-                    generation=generation,
+                    generate=generate,
+                    processor=processor,
+                    model=model,
+                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                    answers_path=answers_path,
                 )
-                write_jsonl(answers_path, answer_row)
                 real_answer_rows_by_alpha[alpha].append(answer_row)
 
-                prefill_h = torch.stack(
-                    generation["hidden_states"][0], dim=0
-                ).squeeze(1)
-                vision_h = prefill_h[:, generation["prompt_image_mask"], :]
-                text_h = prefill_h[:, generation["prompt_text_mask"], :]
-                vm = compute_metrics(vision_h)
-                tm = compute_metrics(text_h)
-
-                attention_metrics = compute_attention_metrics(
-                    generation["attentions"],
-                    generation["prompt_image_mask"],
-                    generation["prompt_text_mask"],
-                )
                 logits = generation_logits(generation)
                 vision_attention = extract_vision_attention(generation)
                 generated_token_ids = generation["generated_token_ids"].detach().cpu()
+                real_answers_by_alpha[alpha] = answer_row
+                if logits is not None:
+                    real_logits_by_alpha[alpha] = logits
 
                 if alpha == baseline_alpha:
                     baseline_logits = logits
@@ -411,48 +510,78 @@ def run(
                         ),
                     )
 
-                torch.save(
-                    to_saveable({
-                        "run_id": run_id,
-                        "subset": subset,
-                        "sample_id": sample_id,
-                        "condition": condition,
-                        "alpha": alpha,
-                        "intervention": alpha_intervention_config,
-                        "vision_norms": vm["norms"].cpu().float(),
-                        "vision_abs": vm["abs"].cpu().float(),
-                        "vision_rel": vm["rel"].cpu().float(),
-                        "vision_cos": vm["cos"].cpu().float(),
-                        "vision_update_align": vm["update_align"].cpu().float(),
-                        "vision_adjacent_cos": vm["adjacent_cos"].cpu().float(),
-                        "text_norms": tm["norms"].cpu().float(),
-                        "text_abs": tm["abs"].cpu().float(),
-                        "text_rel": tm["rel"].cpu().float(),
-                        "text_cos": tm["cos"].cpu().float(),
-                        "text_update_align": tm["update_align"].cpu().float(),
-                        "text_adjacent_cos": tm["adjacent_cos"].cpu().float(),
-                        "vision_attention_mass": attention_metrics[
-                            "vision_attention_mass"
-                        ],
-                        "text_attention_mass": attention_metrics[
-                            "text_attention_mass"
-                        ],
-                        "attention_entropy_over_vision": attention_metrics[
-                            "attention_entropy_over_vision"
-                        ],
-                        "generated_token_ids": generated_token_ids,
-                        "prompt_length": generation["prompt_length"],
-                        "prompt_image_token_count": int(
-                            generation["prompt_image_mask"].sum()
-                        ),
-                        "prompt_text_token_count": int(
-                            generation["prompt_text_mask"].sum()
-                        ),
-                    }),
-                    alpha_dir / "metrics.pt",
+                blank_condition = condition_name("blank", alpha)
+                blank_answer_row, blank_generation = collect_multimodal_condition(
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    subset=subset,
+                    sample=sample,
+                    prompt=prompt,
+                    image=blank_image_like(sample["image"]),
+                    condition=blank_condition,
+                    condition_dir_name=f"blank_{alpha_dir_name(alpha)}",
+                    intervention_config=alpha_intervention_config,
+                    generate=generate,
+                    processor=processor,
+                    model=model,
+                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                    answers_path=answers_path,
                 )
-                del generation, prefill_h, vision_h, text_h, vm, tm
-                del attention_metrics, logits, vision_attention, generated_token_ids
+                blank_answer_rows_by_alpha[alpha].append(blank_answer_row)
+                blank_answers_by_alpha[alpha] = blank_answer_row
+
+                blank_logits = generation_logits(blank_generation)
+                blank_generated_token_ids = blank_generation[
+                    "generated_token_ids"
+                ].detach().cpu()
+                if blank_logits is not None:
+                    blank_logits_by_alpha[alpha] = blank_logits
+
+                if alpha == baseline_alpha:
+                    blank_baseline_logits = blank_logits
+                    blank_baseline_generated_token_ids = blank_generated_token_ids
+
+                if logits is not None and blank_logits is not None:
+                    write_jsonl_rows(
+                        condition_logit_comparisons_path,
+                        compute_logit_comparison_rows(
+                            subset=subset,
+                            sample_id=sample_id,
+                            comparison="real_vs_blank_same_alpha",
+                            condition=condition,
+                            reference_condition=blank_condition,
+                            alpha=alpha,
+                            reference_alpha=alpha,
+                            logits=logits,
+                            reference_logits=blank_logits,
+                            reference_generated_token_ids=blank_generated_token_ids,
+                        ),
+                    )
+
+                if (
+                    alpha != baseline_alpha
+                    and logits is not None
+                    and blank_baseline_logits is not None
+                ):
+                    write_jsonl_rows(
+                        condition_logit_comparisons_path,
+                        compute_logit_comparison_rows(
+                            subset=subset,
+                            sample_id=sample_id,
+                            comparison="real_vs_blank_alpha_1",
+                            condition=condition,
+                            reference_condition=condition_name("blank", baseline_alpha),
+                            alpha=alpha,
+                            reference_alpha=baseline_alpha,
+                            logits=logits,
+                            reference_logits=blank_baseline_logits,
+                            reference_generated_token_ids=blank_baseline_generated_token_ids,
+                        ),
+                    )
+
+                del generation, blank_generation
+                del logits, vision_attention, generated_token_ids
+                del blank_logits, blank_generated_token_ids
 
             textonly_generation = generate_text_only(
                 prompt,
@@ -460,7 +589,7 @@ def run(
                 model,
                 max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                 output_attentions=False,
-                output_scores=False,
+                output_scores=True,
             )
             textonly_intervention_config = {"type": "textonly", "alpha": None}
             textonly_answer_row = build_answer_row(
@@ -474,6 +603,117 @@ def run(
             )
             write_jsonl(answers_path, textonly_answer_row)
             textonly_answer_rows.append(textonly_answer_row)
+            textonly_logits = generation_logits(textonly_generation)
+            textonly_generated_token_ids = textonly_generation[
+                "generated_token_ids"
+            ].detach().cpu()
+
+            if textonly_logits is not None:
+                for alpha in ordered_alphas:
+                    real_logits = real_logits_by_alpha.get(alpha)
+                    if real_logits is not None:
+                        write_jsonl_rows(
+                            condition_logit_comparisons_path,
+                            compute_logit_comparison_rows(
+                                subset=subset,
+                                sample_id=sample_id,
+                                comparison="real_vs_textonly",
+                                condition=condition_name("real", alpha),
+                                reference_condition="textonly",
+                                alpha=alpha,
+                                reference_alpha=None,
+                                logits=real_logits,
+                                reference_logits=textonly_logits,
+                                reference_generated_token_ids=textonly_generated_token_ids,
+                            ),
+                        )
+
+                    blank_logits = blank_logits_by_alpha.get(alpha)
+                    if blank_logits is not None:
+                        write_jsonl_rows(
+                            condition_logit_comparisons_path,
+                            compute_logit_comparison_rows(
+                                subset=subset,
+                                sample_id=sample_id,
+                                comparison="blank_vs_textonly",
+                                condition=condition_name("blank", alpha),
+                                reference_condition="textonly",
+                                alpha=alpha,
+                                reference_alpha=None,
+                                logits=blank_logits,
+                                reference_logits=textonly_logits,
+                                reference_generated_token_ids=textonly_generated_token_ids,
+                            ),
+                        )
+
+            real_baseline_answer = real_answers_by_alpha[baseline_alpha]
+            blank_baseline_answer = blank_answers_by_alpha[baseline_alpha]
+            real_blank_stats = compute_logit_kl_stats(
+                real_logits_by_alpha.get(baseline_alpha),
+                blank_logits_by_alpha.get(baseline_alpha),
+            )
+            real_textonly_stats = compute_logit_kl_stats(
+                real_logits_by_alpha.get(baseline_alpha),
+                textonly_logits,
+            )
+            blank_textonly_stats = compute_logit_kl_stats(
+                blank_logits_by_alpha.get(baseline_alpha),
+                textonly_logits,
+            )
+            real_blank_answer_changed = (
+                real_baseline_answer["generated_text"]
+                != blank_baseline_answer["generated_text"]
+            )
+            real_textonly_answer_changed = (
+                real_baseline_answer["generated_text"]
+                != textonly_answer_row["generated_text"]
+            )
+            real_blank_kl = real_blank_stats["mean_kl"]
+            real_textonly_kl = real_textonly_stats["mean_kl"]
+            keep_for_intervention_sweep = (
+                real_blank_answer_changed
+                or real_textonly_answer_changed
+                or (
+                    real_blank_kl is not None
+                    and real_blank_kl > IMAGE_SENSITIVITY_KL_THRESHOLD
+                )
+                or (
+                    real_textonly_kl is not None
+                    and real_textonly_kl > IMAGE_SENSITIVITY_KL_THRESHOLD
+                )
+            )
+            write_jsonl(
+                vision_sensitivity_path,
+                {
+                    "run_id": run_id,
+                    "subset": subset,
+                    "sample_id": sample_id,
+                    "baseline_alpha": baseline_alpha,
+                    "kl_threshold": IMAGE_SENSITIVITY_KL_THRESHOLD,
+                    "real_condition": condition_name("real", baseline_alpha),
+                    "blank_condition": condition_name("blank", baseline_alpha),
+                    "textonly_condition": "textonly",
+                    "real_generated_text": real_baseline_answer["generated_text"],
+                    "blank_generated_text": blank_baseline_answer["generated_text"],
+                    "textonly_generated_text": textonly_answer_row["generated_text"],
+                    "answer_changed_real_vs_blank": int(real_blank_answer_changed),
+                    "answer_changed_real_vs_textonly": int(
+                        real_textonly_answer_changed
+                    ),
+                    "real_vs_blank_mean_kl": real_blank_stats["mean_kl"],
+                    "real_vs_blank_max_kl": real_blank_stats["max_kl"],
+                    "real_vs_blank_n_steps": real_blank_stats["n_steps"],
+                    "real_vs_textonly_mean_kl": real_textonly_stats["mean_kl"],
+                    "real_vs_textonly_max_kl": real_textonly_stats["max_kl"],
+                    "real_vs_textonly_n_steps": real_textonly_stats["n_steps"],
+                    "blank_vs_textonly_mean_kl": blank_textonly_stats["mean_kl"],
+                    "blank_vs_textonly_max_kl": blank_textonly_stats["max_kl"],
+                    "blank_vs_textonly_n_steps": blank_textonly_stats["n_steps"],
+                    "keep_for_intervention_sweep": int(keep_for_intervention_sweep),
+                    "answer": sample.get("answer"),
+                    "all_answers": sample.get("all_answers"),
+                },
+            )
 
             textonly_h = torch.stack(
                 textonly_generation["hidden_states"][0], dim=0
@@ -508,6 +748,7 @@ def run(
                 textonly_dir / "metrics.pt",
             )
             del textonly_generation, textonly_h, tom
+            del textonly_logits, textonly_generated_token_ids
 
         for alpha, real_answer_rows in real_answer_rows_by_alpha.items():
             score_answers(
@@ -517,6 +758,15 @@ def run(
                 condition=f"real_alpha_{alpha_label(alpha)}",
                 dataset=subset_ds,
                 answer_rows=real_answer_rows,
+            )
+        for alpha, blank_answer_rows in blank_answer_rows_by_alpha.items():
+            score_answers(
+                run_id=run_id,
+                run_dir=run_dir,
+                subset=subset,
+                condition=f"blank_alpha_{alpha_label(alpha)}",
+                dataset=subset_ds,
+                answer_rows=blank_answer_rows,
             )
         score_answers(
             run_id=run_id,
