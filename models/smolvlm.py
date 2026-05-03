@@ -252,7 +252,6 @@ def generate_text_only(
 
 def register_intervention(model, intervention):
     def hook_fn(module, input, output):
-        print(f"Output shape: {output.size()}")
         modified_output = intervention.reduce_norm(output)
         return modified_output
 
