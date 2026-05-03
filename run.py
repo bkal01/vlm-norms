@@ -169,17 +169,6 @@ def to_saveable(value):
     return value
 
 
-def generation_to_saveable(generation: dict):
-    generation = dict(generation)
-    generation_scores = generation.pop("scores", None)
-    if generation_scores is not None:
-        generation["generation_scores"] = generation_scores
-    generation_logits = generation.pop("logits", None)
-    if generation_logits is not None:
-        generation["generation_logits"] = generation_logits
-    return to_saveable(generation)
-
-
 def tensor_to_json_list(value):
     import torch
 
@@ -191,6 +180,14 @@ def tensor_to_json_list(value):
 def write_jsonl(path: Path, row: dict) -> None:
     with path.open("a") as f:
         f.write(json.dumps(row) + "\n")
+
+
+def write_jsonl_rows(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    with path.open("a") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
 
 
 def build_answer_row(
@@ -276,7 +273,14 @@ def run(
     from datasets import load_dataset
     from tqdm import tqdm
 
-    from models.utils import compute_metrics, compute_attention_metrics
+    from models.utils import (
+        compute_attention_divergence_rows,
+        compute_attention_metrics,
+        compute_logit_sensitivity_rows,
+        compute_metrics,
+        extract_vision_attention,
+        generation_logits,
+    )
 
     load_model, generate, generate_text_only, register_intervention = load_model_fns(
         model_name
@@ -305,6 +309,12 @@ def run(
     intervention = build_intervention(alphas[0])
     register_intervention(model, intervention)
     answers_path = run_dir / "answers.jsonl"
+    logit_sensitivity_path = run_dir / "logit_sensitivity.jsonl"
+    attention_divergence_path = run_dir / "attention_divergence_from_baseline.jsonl"
+    baseline_alpha = 1.0
+    ordered_alphas = [baseline_alpha] + [
+        alpha for alpha in alphas if alpha != baseline_alpha
+    ]
     for subset in subsets:
         ds = load_dataset("DatologyAI/DatBench", subset, split="test")
         n = min(num_samples, len(ds))
@@ -320,7 +330,11 @@ def run(
             fmt = sample["prompt_format"]
             prompt = fmt["prefix"] + sample["question"] + fmt["suffix"]
 
-            for alpha in alphas:
+            baseline_logits = None
+            baseline_generated_token_ids = None
+            baseline_vision_attention = None
+
+            for alpha in ordered_alphas:
                 intervention.alpha = alpha
                 alpha_intervention_config = {"type": "scaled", "alpha": alpha}
                 condition = f"real_alpha_{alpha_label(alpha)}"
@@ -359,6 +373,43 @@ def run(
                     generation["prompt_image_mask"],
                     generation["prompt_text_mask"],
                 )
+                logits = generation_logits(generation)
+                vision_attention = extract_vision_attention(generation)
+                generated_token_ids = generation["generated_token_ids"].detach().cpu()
+
+                if alpha == baseline_alpha:
+                    baseline_logits = logits
+                    baseline_generated_token_ids = generated_token_ids
+                    baseline_vision_attention = vision_attention
+
+                if logits is not None and baseline_logits is not None:
+                    write_jsonl_rows(
+                        logit_sensitivity_path,
+                        compute_logit_sensitivity_rows(
+                            subset=subset,
+                            sample_id=sample_id,
+                            alpha=alpha,
+                            logits=logits,
+                            baseline_logits=baseline_logits,
+                            baseline_generated_token_ids=baseline_generated_token_ids,
+                        ),
+                    )
+
+                if (
+                    alpha != baseline_alpha
+                    and vision_attention is not None
+                    and baseline_vision_attention is not None
+                ):
+                    write_jsonl_rows(
+                        attention_divergence_path,
+                        compute_attention_divergence_rows(
+                            subset=subset,
+                            sample_id=sample_id,
+                            alpha=alpha,
+                            attention=vision_attention,
+                            baseline_attention=baseline_vision_attention,
+                        ),
+                    )
 
                 torch.save(
                     to_saveable({
@@ -389,17 +440,27 @@ def run(
                         "attention_entropy_over_vision": attention_metrics[
                             "attention_entropy_over_vision"
                         ],
-                        "attention_metrics": attention_metrics,
-                        "generation": generation_to_saveable(generation),
+                        "generated_token_ids": generated_token_ids,
+                        "prompt_length": generation["prompt_length"],
+                        "prompt_image_token_count": int(
+                            generation["prompt_image_mask"].sum()
+                        ),
+                        "prompt_text_token_count": int(
+                            generation["prompt_text_mask"].sum()
+                        ),
                     }),
                     alpha_dir / "metrics.pt",
                 )
+                del generation, prefill_h, vision_h, text_h, vm, tm
+                del attention_metrics, logits, vision_attention, generated_token_ids
 
             textonly_generation = generate_text_only(
                 prompt,
                 processor,
                 model,
                 max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                output_attentions=False,
+                output_scores=False,
             )
             textonly_intervention_config = {"type": "textonly", "alpha": None}
             textonly_answer_row = build_answer_row(
@@ -436,12 +497,17 @@ def run(
                     "textonly_cos": tom["cos"].cpu().float(),
                     "textonly_update_align": tom["update_align"].cpu().float(),
                     "textonly_adjacent_cos": tom["adjacent_cos"].cpu().float(),
-                    "textonly_generation": generation_to_saveable(
-                        textonly_generation
+                    "generated_token_ids": textonly_generation[
+                        "generated_token_ids"
+                    ].detach().cpu(),
+                    "prompt_length": textonly_generation["prompt_length"],
+                    "prompt_text_token_count": int(
+                        textonly_generation["prompt_text_mask"].sum()
                     ),
                 }),
                 textonly_dir / "metrics.pt",
             )
+            del textonly_generation, textonly_h, tom
 
         for alpha, real_answer_rows in real_answer_rows_by_alpha.items():
             score_answers(

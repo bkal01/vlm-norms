@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import json
 import uuid
 from pathlib import Path
 
@@ -11,6 +12,34 @@ import torch
 
 
 BASELINE_ALPHA = 1.0
+PRECOMPUTED_FILENAME = "logit_sensitivity.jsonl"
+
+
+def load_precomputed_rows(run_dir: Path, max_steps: int | None) -> list[dict]:
+    path = run_dir / PRECOMPUTED_FILENAME
+    if not path.exists():
+        return []
+
+    rows = []
+    with path.open() as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON on {path}:{line_number}") from exc
+            if max_steps is not None and int(row["step"]) >= max_steps:
+                continue
+            row["alpha"] = float(row["alpha"])
+            row["step"] = int(row["step"])
+            row["kl"] = float(row["kl"])
+            row["baseline_token_prob"] = float(row["baseline_token_prob"])
+            row["baseline_token_rank"] = int(row["baseline_token_rank"])
+            row["greedy_agreement"] = int(row["greedy_agreement"])
+            rows.append(row)
+    return rows
 
 
 def load_metrics(path: Path) -> dict:
@@ -106,6 +135,9 @@ def compute_sample_rows(sample_dir: Path, by_alpha: dict[float, dict]) -> list[d
 
 
 def compute_run_rows(run_dir: Path, max_steps: int | None) -> list[dict]:
+    if (run_dir / PRECOMPUTED_FILENAME).exists():
+        return load_precomputed_rows(run_dir, max_steps)
+
     rows = []
     sample_dirs = sorted({
         path.parent.parent

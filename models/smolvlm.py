@@ -133,7 +133,7 @@ def generate(
         "return_dict_in_generate": True,
     }
     if hasattr(getattr(model, "generation_config", None), "output_logits"):
-        generation_args["output_logits"] = True
+        generation_args["output_logits"] = False
     generation_args.update(generate_kwargs)
 
     with torch.inference_mode():
@@ -209,7 +209,7 @@ def generate_text_only(
         "return_dict_in_generate": True,
     }
     if hasattr(getattr(model, "generation_config", None), "output_logits"):
-        generation_args["output_logits"] = True
+        generation_args["output_logits"] = False
     generation_args.update(generate_kwargs)
 
     with torch.inference_mode():
