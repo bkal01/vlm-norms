@@ -33,56 +33,32 @@ def compute_metrics(h: torch.Tensor) -> dict[str, torch.Tensor]:
         "adjacent_cos": adjacent_cos,
     }
 
-def compute_attention_metrics(
-        attentions,
-        prompt_image_mask,
-        prompt_text_mask,
-):
+def compute_vision_attention_mass(attentions, prompt_image_mask, query_mask=None):
     prompt_length = prompt_image_mask.shape[0]
     vision_attention_mass = []
-    text_attention_mass = []
-    attention_entropy_over_vision = []
 
     for step_attentions in attentions:
         per_step_vision_mass = []
-        per_step_text_mass = []
-        per_step_vision_entropy = []
         for attn in step_attentions:
-            prompt_attention = attn[..., :prompt_length]
-            vision_attn = prompt_attention[..., prompt_image_mask]
-
-            vision_mass = vision_attn.sum(dim=-1)
-            vision_mass = vision_mass[..., -1]
+            vision_mass = attn[..., :prompt_length][..., prompt_image_mask].sum(dim=-1)
+            if query_mask is None:
+                vision_mass = vision_mass[..., -1]
+            else:
+                if vision_mass.shape[-1] != query_mask.shape[0]:
+                    raise ValueError(
+                        "query_mask length does not match attention query length: "
+                        f"{query_mask.shape[0]} != {vision_mass.shape[-1]}"
+                    )
+                vision_mass = vision_mass[..., query_mask]
             per_step_vision_mass.append(vision_mass)
 
-            text_mass = prompt_attention[..., prompt_text_mask].sum(dim=-1)
-            text_mass = text_mass[..., -1]
-            per_step_text_mass.append(text_mass)
-
-            vision_mass_for_entropy = vision_attn.sum(dim=-1, keepdim=True)
-            vision_probs = vision_attn / vision_mass_for_entropy.clamp(min=1e-8)
-            vision_entropy = -(vision_probs * vision_probs.clamp(min=1e-8).log()).sum(dim=-1)
-            vision_entropy = vision_entropy[..., -1]
-            per_step_vision_entropy.append(vision_entropy)
-
         per_step_vision_mass = torch.stack(per_step_vision_mass)
-        per_step_text_mass = torch.stack(per_step_text_mass)
-        per_step_vision_entropy = torch.stack(per_step_vision_entropy)
+        mean_dims = tuple(range(1, per_step_vision_mass.ndim))
         vision_attention_mass.append(
-            per_step_vision_mass.mean(dim=(1, 2))
-        )
-        text_attention_mass.append(
-            per_step_text_mass.mean(dim=(1, 2))
-        )
-        attention_entropy_over_vision.append(
-            per_step_vision_entropy.mean(dim=(1, 2))
+            per_step_vision_mass.mean(dim=mean_dims)
         )
 
-    return {
-        "vision_attention_mass": torch.stack(vision_attention_mass),
-        "text_attention_mass": torch.stack(text_attention_mass),
-        "attention_entropy_over_vision": torch.stack(attention_entropy_over_vision),
-    }
+    return torch.stack(vision_attention_mass)
 
 
 def generation_logits(generation: dict) -> torch.Tensor | None:
@@ -254,13 +230,15 @@ def extract_vision_attention(generation: dict) -> torch.Tensor | None:
     prompt_length = int(generation["prompt_length"])
 
     by_step = []
-    for step_attentions in attentions:
+    for step_attentions in attentions[1:]:
         by_layer = []
         for attn in step_attentions:
             prompt_attn = attn.detach().cpu()[..., -1, :prompt_length]
             by_layer.append(prompt_attn[..., prompt_image_mask].squeeze(0))
         by_step.append(torch.stack(by_layer))
 
+    if not by_step:
+        return None
     return torch.stack(by_step).float()
 
 

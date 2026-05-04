@@ -291,7 +291,7 @@ def collect_multimodal_condition(
 ) -> tuple[dict, dict]:
     import torch
 
-    from models.utils import compute_attention_metrics, compute_metrics
+    from models.utils import compute_metrics, compute_vision_attention_mass
 
     sample_id = sample["id"]
     condition_dir = run_dir / subset / sample_id / condition_dir_name
@@ -321,11 +321,30 @@ def collect_multimodal_condition(
     vm = compute_metrics(vision_h)
     tm = compute_metrics(text_h)
 
-    attention_metrics = compute_attention_metrics(
-        generation["attentions"],
+    prefill_attentions = generation["attentions"][:1]
+    decode_attentions = generation["attentions"][1:]
+    if not prefill_attentions:
+        raise ValueError("generation did not return a prefill attention step")
+    first_attention = prefill_attentions[0][0]
+    prompt_length = generation["prompt_image_mask"].shape[0]
+    if first_attention.shape[-2] != prompt_length:
+        raise ValueError(
+            "first attention step is not full-prompt prefill attention: "
+            f"query length {first_attention.shape[-2]} != prompt length {prompt_length}"
+        )
+
+    if decode_attentions:
+        decoder_vision_attention_mass = compute_vision_attention_mass(
+            decode_attentions,
+            generation["prompt_image_mask"],
+        )
+    else:
+        decoder_vision_attention_mass = torch.empty((0, len(prefill_attentions[0])))
+    prefill_text_query_vision_attention_mass = compute_vision_attention_mass(
+        prefill_attentions,
         generation["prompt_image_mask"],
-        generation["prompt_text_mask"],
-    )
+        query_mask=generation["prompt_text_mask"],
+    ).squeeze(0)
     generated_token_ids = generation["generated_token_ids"].detach().cpu()
 
     torch.save(
@@ -348,11 +367,10 @@ def collect_multimodal_condition(
             "text_cos": tm["cos"].cpu().float(),
             "text_update_align": tm["update_align"].cpu().float(),
             "text_adjacent_cos": tm["adjacent_cos"].cpu().float(),
-            "vision_attention_mass": attention_metrics["vision_attention_mass"],
-            "text_attention_mass": attention_metrics["text_attention_mass"],
-            "attention_entropy_over_vision": attention_metrics[
-                "attention_entropy_over_vision"
-            ],
+            "decoder_vision_attention_mass": decoder_vision_attention_mass,
+            "prefill_text_query_vision_attention_mass": (
+                prefill_text_query_vision_attention_mass
+            ),
             "generated_token_ids": generated_token_ids,
             "prompt_length": generation["prompt_length"],
             "prompt_image_token_count": int(generation["prompt_image_mask"].sum()),
